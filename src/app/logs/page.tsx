@@ -55,7 +55,7 @@ const emptyTask = (envId = 'test'): Partial<MonitorTask> => ({
   immediate_keywords: [],
   ignore_keywords: [],
   record_only_keywords: [],
-  alert_threshold_count: 5,
+  alert_threshold_count: 1,
   alert_threshold_window: 60,
   alert_silence_minutes: 60,
   retention_days: 3,
@@ -509,7 +509,7 @@ function LogsPageContent() {
             <Field label="即时告警关键词（每行一个）"><textarea rows={2} value={linesToText(draft.immediate_keywords as string[])} onChange={(e) => setDraft({ ...draft, immediate_keywords: e.target.value.split('\n') })} className="input-field" /></Field>
             <Field label="阈值告警关键词"><textarea rows={2} value={linesToText(draft.alert_keywords as string[])} onChange={(e) => setDraft({ ...draft, alert_keywords: e.target.value.split('\n') })} className="input-field" /></Field>
             <div className="grid grid-cols-3 gap-2">
-              <Field label="阈值次数"><input type="number" value={draft.alert_threshold_count || 5} onChange={(e) => setDraft({ ...draft, alert_threshold_count: +e.target.value })} className="input-field" /></Field>
+              <Field label="阈值次数"><input type="number" value={draft.alert_threshold_count ?? 1} onChange={(e) => setDraft({ ...draft, alert_threshold_count: +e.target.value })} className="input-field" /></Field>
               <Field label="窗口(秒)"><input type="number" value={draft.alert_threshold_window || 60} onChange={(e) => setDraft({ ...draft, alert_threshold_window: +e.target.value })} className="input-field" /></Field>
               <Field label="静默(分)"><input type="number" value={draft.alert_silence_minutes || 60} onChange={(e) => setDraft({ ...draft, alert_silence_minutes: +e.target.value })} className="input-field" /></Field>
             </div>

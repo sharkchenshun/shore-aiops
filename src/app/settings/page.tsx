@@ -28,7 +28,7 @@ function StatusIcon({ status }: { status?: CheckStatus }) {
   return <XCircle size={16} className="text-red-400" />
 }
 
-function KubeconfigEditor({ environments }: { environments: Array<{ id: string; label: string; clusterName: string; kubeconfigConfigured?: boolean }> }) {
+function KubeconfigEditor({ environments }: { environments: Array<{ id: string; label: string; clusterName: string; kubeconfigConfigured?: boolean; kubeconfigStatus?: string; kubeconfigDetail?: string }> }) {
   const [selected, setSelected] = useState('')
   const [text, setText] = useState('')
   const [saving, setSaving] = useState(false)
@@ -57,9 +57,19 @@ function KubeconfigEditor({ environments }: { environments: Array<{ id: string; 
 
   if (!environments.length) return null
   const cur = environments.find(e => e.id === selected)
+  const authOk = cur?.kubeconfigStatus === 'ok'
+  const authErr = cur?.kubeconfigStatus === 'error'
 
   return (
     <div className="space-y-3">
+      {cur && (
+        <div className={`text-xs rounded-lg px-3 py-2 border ${authOk ? 'border-emerald-500/30 text-emerald-300 bg-emerald-500/10' : authErr ? 'border-red-500/30 text-red-300 bg-red-500/10' : 'border-amber-500/30 text-amber-300 bg-amber-500/10'}`}>
+          {authOk ? '✓ K8s 连接正常' : authErr ? `✗ ${cur.kubeconfigDetail || 'K8s 认证失败'}` : (cur.kubeconfigConfigured ? '未检测连接' : '未配置 kubeconfig')}
+          {authErr && cur.kubeconfigDetail?.includes('过期') && (
+            <p className="mt-1 text-shark-muted">请向集群管理员重新签发证书，粘贴<strong>新的</strong> kubeconfig（不是同一份旧文件）。</p>
+          )}
+        </div>
+      )}
       <div className="flex items-center gap-3">
         <select
           value={selected}
@@ -186,7 +196,7 @@ export default function SettingsPage() {
 
         <section className="glass rounded-xl p-5">
           <h3 className="text-sm font-semibold text-white mb-1">运行环境</h3>
-          <p className="text-[10px] text-shark-muted mb-3">切换后拓扑、Pod、监控检查会按所选 K8s 集群（context）过滤。</p>
+          <p className="text-[10px] text-shark-muted mb-3">切换后 UI 按所选环境过滤；各环境使用下方单独粘贴入库的 kubeconfig，与本地 kubectl 无关。</p>
           {environments.length > 1 ? (
             <select
               value={active}
@@ -208,7 +218,7 @@ export default function SettingsPage() {
         <section className="glass rounded-xl p-5">
           <h3 className="text-sm font-semibold text-white mb-1">K8s 集群凭证</h3>
           <p className="text-[10px] text-shark-muted mb-4">
-            在 master 上执行 <code className="text-shark-accent">cat /etc/kubernetes/admin.conf</code>，复制内容粘贴到对应环境，保存即可。
+            将各环境 kubeconfig 粘贴保存到数据库，部署到服务器时无需拷贝本地文件。保存时会自动测试连通性。
           </p>
           <KubeconfigEditor environments={environments} />
         </section>

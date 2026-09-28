@@ -193,6 +193,19 @@ def keyword_matches_line(keyword: str, line: str, app_level: str = "") -> bool:
     return bool(re.search(rf"\b{re.escape(kw)}\b", low))
 
 
+def immediate_keyword_matches_line(keyword: str, line: str) -> bool:
+    """即时告警关键字：短语子串匹配（支持 Cause: xxx 等堆栈行）。"""
+    kw = (keyword or "").strip().lower()
+    if not kw:
+        return False
+    from app.services.log_monitor.alert_digest import _clean_log_line
+
+    clean = _clean_log_line(line)
+    if is_access_log_noise(line) or is_access_log_noise(clean):
+        return False
+    return kw in clean.lower()
+
+
 def is_meaningful_alert_digest(digest: str) -> bool:
     """Slack 摘要是否包含可读的错误信息（非配置噪声）。"""
     if not digest or not digest.strip():

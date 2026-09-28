@@ -77,8 +77,7 @@ class Settings(BaseSettings):
     AUTO_DIAGNOSE_ON_ALERT: bool = True
 
     # ---- Infra Discovery ----
-    KUBECONFIG: str = ""            # 标准 K8s 凭证路径；启动时解析入库，运行时从 DB 读取
-    K8S_IN_CLUSTER: bool = False    # 部署到 K8s 内时设为 True
+    K8S_IN_CLUSTER: bool = False       # 部署到 K8s 内时用 in-cluster SA；凭证 otherwise 走 DB
     CLUSTER_NAME: str = "default"   # 集群名称（前端展示用；配置为本环境实际名称）
     DISCOVERY_INTERVAL: int = 300   # 自动发现周期（秒）
 

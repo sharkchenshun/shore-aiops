@@ -48,7 +48,6 @@ class KubernetesProvider(InfrastructureProvider):
 
         in_cluster = self.config.get("in_cluster", False)
         kubeconfig_content = self.config.get("kubeconfig_content")
-        kubeconfig_path = self.config.get("kubeconfig") or None
         try:
             if in_cluster:
                 k8s_config.load_incluster_config()
@@ -58,10 +57,10 @@ class KubernetesProvider(InfrastructureProvider):
                     k8s_config.load_kube_config_from_dict(cfg_dict)
                 else:
                     raise ValueError("invalid kubeconfig content")
-            elif kubeconfig_path:
-                k8s_config.load_kube_config(config_file=kubeconfig_path)
             else:
-                k8s_config.load_kube_config()
+                raise ValueError(
+                    "未配置 kubeconfig，请在 设置 → K8s 集群凭证 粘贴对应环境凭证"
+                )
         except Exception as e:
             logger.error("k8s.config.load_failed", error=str(e))
             raise

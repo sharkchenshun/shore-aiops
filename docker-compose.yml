@@ -48,18 +48,16 @@ services:
       DATABASE_URL: postgresql+asyncpg://bestnative:bestnative@postgres:5432/bestnative
       DATABASE_URL_SYNC: postgresql://bestnative:bestnative@postgres:5432/bestnative
       REDIS_URL: redis://redis:6379/0
-      KUBECONFIG: /tmp/kubeconfig
     ports:
       - "8000:8000"
     volumes:
-      - ${KUBECONFIG:-~/.kube/config}:/tmp/kubeconfig:ro
       - ./backend/config/environments.json:/app/config/environments.json:ro
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    # 挂载 KUBECONFIG + 建表 + 启动时同步 kubeconfig 入库
+    # 建表 + 启动 API（K8s 凭证仅在设置页粘贴入库，不挂载本地 kubeconfig）
     command: ["/app/entrypoint.sh"]
 
   frontend:

@@ -13,6 +13,8 @@ export interface ArchComponent {
   found?: boolean
   replicas?: number
   readyReplicas?: number
+  host?: string
+  matchedName?: string
 }
 
 export interface ArchLayer {
@@ -34,6 +36,9 @@ export interface HomeOverview {
     healthy: number
     degraded: number
     critical: number
+    blueprintTotal?: number
+    blueprintFound?: number
+    blueprintMissing?: number
     activeIncidents: number
   }
   architecture: {
@@ -107,6 +112,8 @@ export default function BusinessArchitecturePanel({ data }: Props) {
                     <div className="text-[10px] text-shark-muted mt-1 font-mono truncate">{c.name}</div>
                     {c.found && c.replicas != null ? (
                       <div className="text-[10px] text-shark-muted mt-0.5">{c.readyReplicas}/{c.replicas} ready</div>
+                    ) : c.found && c.host ? (
+                      <div className="text-[10px] text-shark-muted mt-0.5 truncate" title={c.host}>{c.host}</div>
                     ) : (
                       <div className="text-[10px] text-shark-muted/60 mt-0.5">{c.found ? '已发现' : '未同步'}</div>
                     )}
@@ -158,6 +165,11 @@ export default function BusinessArchitecturePanel({ data }: Props) {
               <Server size={14} /> 实时状态
             </div>
             <p>已发现 {stats.services} 个服务、{stats.middlewares} 个中间件</p>
+            <p className="mt-1">蓝图组件 {stats.blueprintFound ?? 0}/{stats.blueprintTotal ?? 0} 已同步
+              {(stats.blueprintMissing ?? 0) > 0 && (
+                <span className="text-amber-400"> · {stats.blueprintMissing} 未同步</span>
+              )}
+            </p>
             <p className="mt-1">
               健康 {stats.healthy} · 降级 {stats.degraded} · 异常 {stats.critical}
             </p>

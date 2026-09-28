@@ -44,7 +44,7 @@ class MonitorTask(TimestampMixin, Base):
     ignore_keywords: Mapped[list] = mapped_column(JSONB, default=list)
     record_only_keywords: Mapped[list] = mapped_column(JSONB, default=list)
 
-    alert_threshold_count: Mapped[int] = mapped_column(Integer, default=5)
+    alert_threshold_count: Mapped[int] = mapped_column(Integer, default=1)
     alert_threshold_window: Mapped[int] = mapped_column(Integer, default=60)
     alert_silence_minutes: Mapped[int] = mapped_column(Integer, default=60)
 

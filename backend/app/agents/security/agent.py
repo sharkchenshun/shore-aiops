@@ -62,7 +62,7 @@ class SecurityAgent:
             session.completed_at = datetime.now(timezone.utc)
             session.report = (
                 "全平台扫描：未发现可扫描目标。\n"
-                "1) 配置 KUBECONFIG 并等待 discovery 写入节点/中间件\n"
+                "1) 在 设置 → K8s 集群凭证 粘贴各环境 kubeconfig，等待 discovery 写入节点/中间件\n"
                 "2) 或在 .env 设置 SECURITY_SCAN_EXTRA_TARGETS=域名或IP\n"
                 "3) 或使用「手动扫描」输入对外域名/Ingress"
             )

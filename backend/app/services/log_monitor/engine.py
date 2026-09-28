@@ -16,6 +16,7 @@ from app.core.config import settings as app_settings
 from app.services.log_monitor import store as task_store
 from app.services.log_monitor.log_keyword_match import (
     extract_log_level,
+    immediate_keyword_matches_line,
     is_meaningful_alert_digest,
     keyword_matches_line,
     parse_threshold_alert_meta,
@@ -32,6 +33,37 @@ LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 logger = logging.getLogger("monitor")
 
 SLACK_ERROR_CONTEXT_MAX = 12000
+
+# K8s timestamps=True: "2026-09-07T15:16:35.502402671+09:00 message..."
+_LOG_LINE_TS_RE = re.compile(
+    r"^(?P<head>\d{4}-\d{2}-\d{2}T[\d:]+)"
+    r"(?:\.(?P<frac>\d+))?"
+    r"(?P<tz>Z|[+-]\d{2}:\d{2})?"
+)
+
+
+def _parse_log_line_timestamp(line: str) -> float | None:
+    """Parse RFC3339 prefix from K8s pod log lines (handles nanoseconds + TZ)."""
+    if not line:
+        return None
+    ts_part = line.split(" ", 1)[0]
+    if "T" not in ts_part:
+        return None
+    try:
+        m = _LOG_LINE_TS_RE.match(ts_part)
+        if not m:
+            return None
+        frac = (m.group("frac") or "")[:6].ljust(6, "0")
+        tz = m.group("tz") or "+00:00"
+        if tz == "Z":
+            tz = "+00:00"
+        iso = f"{m.group('head')}.{frac}{tz}"
+        dt = datetime.datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=dt_timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return None
 
 
 def _merge_log_context(*chunks: str) -> str:
@@ -157,7 +189,7 @@ class MonitorEngine:
         if last:
             return last
         alert_state = task.alert_state or {}
-        return float(alert_state.get(db_key, 0) or alert_state.get(db_key.split("::", 1)[0], 0) or 0)
+        return float(alert_state.get(db_key, 0) or 0)
 
     def _is_alert_silenced(self, task, keyword: str, namespace: str, pod_name: str, atype: str = "THRESHOLD") -> bool:
         if atype == "IMMEDIATE":
@@ -471,43 +503,30 @@ class MonitorEngine:
         # 2. Rotate & Archive
         self._rotate_and_archive(task)
 
-    def _kubeconfig_content_for_task(self, task) -> str | None:
+    def _kubeconfig_content_for_task(self, task) -> str:
         env_id = getattr(task, "environment_id", None) or "test"
-        try:
-            from app.services.environments import get_profile
-            from app.services.kubeconfig_store import get_cluster_kubeconfig_sync, materialize_kubeconfig_yaml
-            profile = get_profile(env_id)
-            if profile:
-                content = get_cluster_kubeconfig_sync(profile.cluster_name)
-                if content:
-                    return content
-                return materialize_kubeconfig_yaml(profile)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("k8s.kubeconfig.resolve.failed", env=env_id, error=str(exc)[:80])
-        return None
+        from app.services.environments import get_profile
+        from app.services.kubeconfig_store import require_kubeconfig_content
+
+        profile = get_profile(env_id)
+        if not profile:
+            raise RuntimeError(f"未知环境: {env_id}")
+        return require_kubeconfig_content(profile)
 
     def _get_k8s_client(self, task):
         if not client:
             raise ImportError("kubernetes package not installed")
 
+        import yaml
+
         if task.k8s_kubeconfig:
-            import tempfile
-            import yaml
-            with tempfile.NamedTemporaryFile(mode='w', delete=False) as tf:
-                tf.write(task.k8s_kubeconfig)
-                tf.flush()
-                k8s_config.load_kube_config(config_file=tf.name)
-                os.unlink(tf.name)
+            k8s_config.load_kube_config_from_dict(yaml.safe_load(task.k8s_kubeconfig))
         else:
             try:
                 k8s_config.load_incluster_config()
             except Exception:
                 content = self._kubeconfig_content_for_task(task)
-                if content:
-                    import yaml
-                    k8s_config.load_kube_config_from_dict(yaml.safe_load(content))
-                else:
-                    k8s_config.load_kube_config()
+                k8s_config.load_kube_config_from_dict(yaml.safe_load(content))
 
         return client.CoreV1Api()
 
@@ -556,13 +575,18 @@ class MonitorEngine:
         task_log_dir = os.path.join(self.LOG_DIR, str(task.id))
         os.makedirs(task_log_dir, exist_ok=True)
 
+        ns_errors: list[str] = []
+        pods_processed = 0
+
         for namespace in namespaces:
             try:
                 pods = api.list_namespaced_pod(namespace)
             except Exception as e:
+                err = f"{namespace}: {e}"
                 logger.error(f"Failed to list pods in namespace {namespace}: {e}")
+                ns_errors.append(err)
                 continue
-            
+
             for pod in pods.items:
                 pod_name = pod.metadata.name
                 if not pod.spec.containers:
@@ -626,6 +650,16 @@ class MonitorEngine:
                 except Exception as e:
                     # logger.warning(f"Failed to read log for {pod_name}: {e}")
                     pass
+                else:
+                    pods_processed += 1
+
+        if ns_errors and pods_processed == 0:
+            msg = "; ".join(ns_errors)
+            if "401" in msg or "Unauthorized" in msg:
+                raise RuntimeError(
+                    f"K8s 凭证失效 ({msg})，请在 设置 → K8s 集群凭证 更新 {getattr(task, 'environment_id', 'dev')} 环境 kubeconfig"
+                )
+            raise RuntimeError(f"无法拉取 Pod 日志: {msg}")
 
     def _process_log_stream(
         self, stream, task, source_name, log_dir, log_file_path,
@@ -670,7 +704,8 @@ class MonitorEngine:
         # Load persistent threshold state from task if available, or init new
         threshold_state = task.threshold_state or {}
         threshold_window = task.alert_threshold_window # e.g. 60
-        threshold_count = task.alert_threshold_count # e.g. 5
+        threshold_count = task.alert_threshold_count or 1
+        threshold_count = max(1, min(threshold_count, 20))
         threshold_updated = False
         
         # Keywords
@@ -885,6 +920,16 @@ class MonitorEngine:
                 is_stack_line = _is_stack_line(line)
 
                 if stack_capture_active and is_stack_line:
+                    if clean_immediate_keywords:
+                        for k in clean_immediate_keywords:
+                            if immediate_keyword_matches_line(k, line):
+                                alerts.append({
+                                    'type': 'IMMEDIATE',
+                                    'keyword': k,
+                                    'msg': f"[IMMEDIATE] {line}",
+                                })
+                                break
+
                     formatted = _format_stack_line(line)
                     error_lines.append(formatted.rstrip('\n'))
                     if write_raw_s3:
@@ -918,7 +963,7 @@ class MonitorEngine:
                 is_alert = False
                 if clean_immediate_keywords:
                     for k in clean_immediate_keywords:
-                        if keyword_matches_line(k, line, app_level):
+                        if immediate_keyword_matches_line(k, line):
                             alerts.append({
                                 'type': 'IMMEDIATE',
                                 'keyword': k,
@@ -928,17 +973,16 @@ class MonitorEngine:
                             break # Match first keyword only per line to avoid dupes
                 
                 # 2. Threshold Alerts
-                current_ts = time.time()
-                try:
-                    ts_str = line[:19]
-                    dt = datetime.datetime.fromisoformat(ts_str)
-                    current_ts = dt.timestamp()
-                except:
-                    pass
+                current_ts = _parse_log_line_timestamp(line) or time.time()
 
                 if clean_alert_keywords:
                     for k in clean_alert_keywords:
-                        if keyword_matches_line(k, line, app_level):
+                        matched = keyword_matches_line(k, line, app_level)
+                        if not matched and k == "error" and app_level in ("ERROR", "FATAL"):
+                            matched = True
+                        if not matched and k == "exception" and app_level in ("ERROR", "FATAL") and "exception" in line_lower:
+                            matched = True
+                        if matched:
                             if k not in threshold_state:
                                 threshold_state[k] = []
                             threshold_state[k].append(current_ts)
@@ -1111,6 +1155,13 @@ class MonitorEngine:
                 pod_name=pod_name,
                 container_name=container_name,
             )
+            logger.info(
+                "monitor.alerts.triggered task=%s pod=%s count=%d types=%s",
+                task.name,
+                source_name,
+                len(alerts),
+                ",".join({a.get("type", "?") for a in alerts}),
+            )
 
         self._write_scan_postprocess(
             source_name, log_dir, count_error, count_warn, count_info, count_other, alerts, error_lines,
@@ -1211,7 +1262,6 @@ class MonitorEngine:
                 filtered_alerts.append(alert)
             elif not self._is_alert_silenced(task, keyword, namespace, pod_name, atype):
                 filtered_alerts.append(alert)
-                self._mark_alert_sent(task, keyword, namespace, pod_name)
             else:
                 db_key = _alert_silence_db_key(keyword, namespace, pod_name)
                 last_sent = self._alert_silence_last_sent(task, db_key)
@@ -1289,9 +1339,33 @@ class MonitorEngine:
 
         try:
             payload = {"blocks": blocks}
-            httpx.post(webhook_url, json=payload, timeout=10)
+            resp = httpx.post(webhook_url, json=payload, timeout=10)
+            if resp.status_code >= 400:
+                logger.error(
+                    "Slack webhook failed for task %s: HTTP %s %s",
+                    task.name,
+                    resp.status_code,
+                    (resp.text or "")[:300],
+                )
+                return
+            for alert in filtered_alerts:
+                atype = alert.get("type")
+                if atype != "IMMEDIATE":
+                    self._mark_alert_sent(
+                        task,
+                        alert.get("keyword", ""),
+                        namespace,
+                        pod_name,
+                    )
             task.alerts_sent_count = (task.alerts_sent_count or 0) + len(filtered_alerts)
             task_store.save_task(task, ['alerts_sent_count'])
+            logger.info(
+                "Slack alert sent for task %s (%s/%s): %d alert(s)",
+                task.name,
+                namespace,
+                _pod_deployment_key(pod_name) or pod_name,
+                len(filtered_alerts),
+            )
         except Exception as e:
             logger.error(f"Failed to send slack alert: {e}")
 
