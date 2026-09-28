@@ -24,7 +24,6 @@ def _ensure_engine():
         _SessionLocal = sessionmaker(
             bind=_sync_engine,
             expire_on_commit=False,
-            expire_on_close=False,
         )
 
 

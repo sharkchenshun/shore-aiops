@@ -168,7 +168,11 @@ def _client_cert_expiry_hint(data: dict) -> str:
                 base64.b64decode(cert_b64), default_backend()
             )
             now = dt.datetime.now(dt.timezone.utc)
-            after = cert.not_valid_after_utc
+            after = getattr(cert, "not_valid_after_utc", None)
+            if after is None:
+                after = cert.not_valid_after
+                if after.tzinfo is None:
+                    after = after.replace(tzinfo=dt.timezone.utc)
             if now > after:
                 return f"客户端证书已于 {after.strftime('%Y-%m-%d %H:%M UTC')} 过期，需向集群管理员重新签发"
             days = (after - now).days

@@ -383,3 +383,14 @@ class PersistenceGuardTests(unittest.TestCase):
     def test_local_rotate_does_not_delete_before_retention_without_s3(self):
         src = (_APP / "services/log_monitor/engine.py").read_text(encoding="utf-8")
         self.assertIn("if not s3_client and file_date > retention_date:", src)
+
+    def test_sessionmaker_avoids_expire_on_close(self):
+        """expire_on_close 要 SQLAlchemy 2.0.22+，镜像可能是 2.0.0 下限。"""
+        for rel in (
+            "services/log_monitor/store.py",
+            "services/inspection/store.py",
+            "services/kubeconfig_store.py",
+            "core/database.py",
+        ):
+            src = (_APP / rel).read_text(encoding="utf-8")
+            self.assertNotIn("expire_on_close", src, rel)
