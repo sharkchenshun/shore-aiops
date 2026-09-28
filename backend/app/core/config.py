@@ -4,12 +4,66 @@
 # 当前环境存 Redis，UI 可切换。无 JSON 时回退 .env 单环境。
 # ============================================================
 
+from __future__ import annotations
+
 from functools import lru_cache
 import os
 from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _pg_url_parts(url: str) -> tuple[str, str] | None:
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    scheme, sep, rest = raw.partition("://")
+    if not sep:
+        return None
+    return scheme.lower(), rest
+
+
+def coerce_sync_database_url(url: str) -> str:
+    """同步引擎只用 psycopg2-binary。SQLAlchemy 2.1 的 postgresql:// 会走 psycopg3。"""
+    raw = (url or "").strip()
+    parts = _pg_url_parts(raw)
+    if not parts:
+        return raw
+    driver, rest = parts
+    if driver in {"postgresql+psycopg2", "postgres+psycopg2"}:
+        return raw
+    if driver in {
+        "postgresql",
+        "postgres",
+        "postgresql+psycopg",
+        "postgres+psycopg",
+        "postgresql+asyncpg",
+        "postgres+asyncpg",
+    }:
+        return f"postgresql+psycopg2://{rest}"
+    return raw
+
+
+def coerce_async_database_url(url: str) -> str:
+    """异步引擎只用 asyncpg；误填 psycopg / psycopg2 时改回 asyncpg。"""
+    raw = (url or "").strip()
+    parts = _pg_url_parts(raw)
+    if not parts:
+        return raw
+    driver, rest = parts
+    if driver in {"postgresql+asyncpg", "postgres+asyncpg"}:
+        return raw
+    if driver in {
+        "postgresql",
+        "postgres",
+        "postgresql+psycopg",
+        "postgres+psycopg",
+        "postgresql+psycopg2",
+        "postgres+psycopg2",
+    }:
+        return f"postgresql+asyncpg://{rest}"
+    return raw
 
 
 class Settings(BaseSettings):
@@ -30,7 +84,7 @@ class Settings(BaseSettings):
 
     # ---- Database (PostgreSQL + pgvector) ----
     DATABASE_URL: str = "postgresql+asyncpg://shore:shore@localhost:5432/shore"
-    DATABASE_URL_SYNC: str = "postgresql://shore:shore@localhost:5432/shore"
+    DATABASE_URL_SYNC: str = "postgresql+psycopg2://shore:shore@localhost:5432/shore"
     DB_POOL_SIZE: int = 20
     DB_MAX_OVERFLOW: int = 10
 
@@ -153,6 +207,15 @@ class Settings(BaseSettings):
 
     # ---- CORS ----
     CORS_ORIGINS: list[str] = ["http://localhost:3456"]
+
+    @property
+    def async_database_url(self) -> str:
+        return coerce_async_database_url(self.DATABASE_URL)
+
+    @property
+    def sync_database_url(self) -> str:
+        """同步引擎只用 psycopg2-binary。不要走 psycopg3（缺 libpq / 接口也不兼容）。"""
+        return coerce_sync_database_url(self.DATABASE_URL_SYNC)
 
     @property
     def log_monitor_dir(self) -> str:

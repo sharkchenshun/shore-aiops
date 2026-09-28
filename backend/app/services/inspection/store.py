@@ -22,7 +22,7 @@ _SessionLocal = None
 def _ensure_engine():
     global _sync_engine, _SessionLocal
     if _sync_engine is None:
-        _sync_engine = create_engine(settings.DATABASE_URL_SYNC, pool_pre_ping=True)
+        _sync_engine = create_engine(settings.sync_database_url, pool_pre_ping=True)
         _SessionLocal = sessionmaker(bind=_sync_engine, expire_on_commit=False)
 
 

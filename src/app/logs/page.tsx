@@ -319,13 +319,17 @@ function LogsPageContent() {
 
   const deleteTask = async (task: MonitorTask) => {
     if (!confirm(`删除监控任务「${task.name}」？`)) return
-    await apiJson(`/api/monitor/tasks/${task.id}`, { method: 'DELETE' })
-    if (selected?.id === task.id) {
-      setSelected(null)
-      setFiles([])
-      setContent('')
+    try {
+      await apiJson(`/api/monitor/tasks/${task.id}`, { method: 'DELETE' })
+      if (selected?.id === task.id) {
+        setSelected(null)
+        setFiles([])
+        setContent('')
+      }
+      await loadTasks()
+    } catch (e) {
+      alert(e instanceof Error ? e.message : '删除失败')
     }
-    await loadTasks()
   }
 
   const downloadLog = async (task: MonitorTask, filename: string) => {
