@@ -17,6 +17,7 @@ from app.core.logging import get_logger
 from app.models.security import Asset, ScanSession, Vulnerability
 from app.schemas.security import ScanRequest
 from app.tools.scanners import SCANNERS
+from app.services.kubeconfig_store import any_cluster_kubeconfig_configured_sync
 
 router = APIRouter(prefix="/security", tags=["security"])
 logger = get_logger("api.security")
@@ -47,7 +48,7 @@ async def scanner_tools():
     network = {name: tool.available() for name, tool in SCANNERS.items()}
     return {
         "network": network,
-        "k8sConfigured": bool(settings.KUBECONFIG or settings.K8S_IN_CLUSTER),
+        "k8sConfigured": any_cluster_kubeconfig_configured_sync(),
         "extraTargets": settings.security_scan_extra_targets(),
         "hints": _scan_hints(network),
     }
@@ -62,8 +63,8 @@ def _scan_hints(network: dict) -> list[str]:
             hints.append("nuclei 不可用 → CVE/Web 漏洞检测跳过")
         if not network.get("nmap"):
             hints.append("nmap 不可用 → 端口与服务识别跳过")
-    if not (settings.KUBECONFIG or settings.K8S_IN_CLUSTER):
-        hints.append("未配置 K8s → 全平台扫描无法自动发现 Ingress/NodePort")
+    if not any_cluster_kubeconfig_configured_sync():
+        hints.append("未配置 K8s → 请在 设置 → K8s 集群凭证 粘贴各环境 kubeconfig")
     if not settings.security_scan_extra_targets():
         hints.append("可设置 SECURITY_SCAN_EXTRA_TARGETS 补充对外域名或 IP")
     if not hints:

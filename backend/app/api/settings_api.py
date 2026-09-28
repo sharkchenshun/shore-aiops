@@ -14,7 +14,10 @@ from app.services.environments import (
     set_active_env_id,
 )
 from app.services.integration_checks import get_integration_checks
-from app.services.kubeconfig_store import cluster_has_kubeconfig, sync_all_cluster_kubeconfigs
+from app.services.kubeconfig_store import (
+    check_cluster_kubeconfig_auth_sync,
+    cluster_has_kubeconfig,
+)
 from app.services.maintenance import add_window, list_windows
 from app.core.database import get_db
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,19 +45,11 @@ async def list_environments(
     for p in list_profiles():
         d = p.to_public_dict()
         d["kubeconfigConfigured"] = await cluster_has_kubeconfig(db, p)
+        auth = check_cluster_kubeconfig_auth_sync(p.cluster_name)
+        d["kubeconfigStatus"] = auth["status"]
+        d["kubeconfigDetail"] = auth["detail"]
         envs.append(d)
     return {"active": active, "environments": envs}
-
-
-@router.post("/kubeconfig/sync")
-async def sync_kubeconfig(
-    db: AsyncSession = Depends(get_db),
-    _user: User = Depends(require_admin),
-):
-    """从 KUBECONFIG 环境变量重新同步各环境 kubeconfig 到数据库。"""
-    count = await sync_all_cluster_kubeconfigs(db)
-    await db.commit()
-    return {"status": "ok", "updated": count}
 
 
 class KubeconfigRequest(BaseModel):

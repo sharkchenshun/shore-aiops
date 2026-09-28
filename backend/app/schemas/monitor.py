@@ -29,7 +29,7 @@ class MonitorTaskCreate(BaseModel):
     immediate_keywords: list[str] = Field(default_factory=list)
     ignore_keywords: list[str] = Field(default_factory=list)
     record_only_keywords: list[str] = Field(default_factory=list)
-    alert_threshold_count: int = 5
+    alert_threshold_count: int = 1
     alert_threshold_window: int = 60
     alert_silence_minutes: int = 60
 

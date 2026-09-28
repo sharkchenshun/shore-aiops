@@ -32,14 +32,57 @@ def load_architecture_blueprint() -> dict:
         return json.load(f)
 
 
-def _match_health(name: str, svc_map: dict, mw_map: dict) -> dict:
-    key = name.lower()
-    for k, s in svc_map.items():
-        if key in k or k in key:
-            return {"health": s["health"], "replicas": s.get("replicas"), "readyReplicas": s.get("readyReplicas"), "found": True}
-    for k, m in mw_map.items():
-        if key in k or k in key:
+def _match_health(
+    name: str,
+    svc_map: dict,
+    mw_by_type: dict,
+    *,
+    component_type: str = "",
+) -> dict:
+    """蓝图组件与发现数据对齐：服务用精确/前缀匹配，中间件按 type 匹配。"""
+    key = (name or "").lower().strip()
+    if not key:
+        return {"health": "unknown", "found": False}
+
+    is_middleware = component_type == "middleware" or key in mw_by_type
+    if is_middleware:
+        m = mw_by_type.get(key)
+        if m:
             return {"health": m["health"], "host": m.get("host"), "found": True}
+        return {"health": "unknown", "found": False}
+
+    if key in svc_map:
+        s = svc_map[key]
+        return {
+            "health": s["health"],
+            "replicas": s.get("replicas"),
+            "readyReplicas": s.get("readyReplicas"),
+            "found": True,
+        }
+
+    # 蓝图名略短于 Deployment 名：exchange-match → exchange-match-service
+    prefix = f"{key}-"
+    candidates = [(k, s) for k, s in svc_map.items() if k.startswith(prefix)]
+    if len(candidates) == 1:
+        k, s = candidates[0]
+        return {
+            "health": s["health"],
+            "replicas": s.get("replicas"),
+            "readyReplicas": s.get("readyReplicas"),
+            "found": True,
+            "matchedName": k,
+        }
+    if len(candidates) > 1:
+        # 多个前缀命中时取 ready 最低的健康状态（更保守）
+        k, s = min(candidates, key=lambda x: (x[1].get("readyReplicas") or 0, x[0]))
+        return {
+            "health": s["health"],
+            "replicas": s.get("replicas"),
+            "readyReplicas": s.get("readyReplicas"),
+            "found": True,
+            "matchedName": k,
+        }
+
     return {"health": "unknown", "found": False}
 
 
@@ -60,14 +103,33 @@ async def build_home_overview(db: AsyncSession, profile: EnvironmentProfile | No
     svc_map = {s.name.lower(): {
         "health": s.health, "replicas": s.replicas, "readyReplicas": s.ready_replicas, "namespace": s.namespace,
     } for s in services}
-    mw_map = {m.name.lower(): {"health": m.health, "host": m.host, "type": m.type} for m in middlewares}
+    mw_by_type: dict[str, dict] = {}
+    for m in middlewares:
+        t = (m.type or "").lower().strip()
+        if not t:
+            continue
+        # 同类型取 health 最差的一条（critical > degraded > healthy）
+        rank = {"critical": 0, "degraded": 1, "unknown": 2, "healthy": 3}.get(m.health or "unknown", 2)
+        prev = mw_by_type.get(t)
+        if prev is None or rank < prev.get("_rank", 99):
+            mw_by_type[t] = {"health": m.health, "host": m.host, "_rank": rank}
 
     layers_out = []
+    blueprint_found = 0
+    blueprint_total = 0
     for layer in blueprint.get("layers", []):
         comps = []
         for c in layer.get("components", []):
-            live = _match_health(c.get("name", ""), svc_map, mw_map)
-            comps.append({**c, **live})
+            blueprint_total += 1
+            live = _match_health(
+                c.get("name", ""),
+                svc_map,
+                mw_by_type,
+                component_type=c.get("type") or "",
+            )
+            if live.get("found"):
+                blueprint_found += 1
+            comps.append({**c, **{k: v for k, v in live.items() if not k.startswith("_")}})
         layers_out.append({**layer, "components": comps})
 
     active_incidents = (
@@ -86,11 +148,17 @@ async def build_home_overview(db: AsyncSession, profile: EnvironmentProfile | No
     degraded = sum(1 for s in services if s.health == "degraded")
     critical = sum(1 for s in services if s.health == "critical")
 
+    from app.services.kubeconfig_store import check_cluster_kubeconfig_auth_sync
+    k8s_auth = check_cluster_kubeconfig_auth_sync(profile.cluster_name)
+
     return {
         "environment": profile.id,
         "environmentLabel": profile.label,
         "clusterName": profile.cluster_name,
         "discoveryPending": cluster_id is None,
+        "k8sAuthStatus": k8s_auth["status"],
+        "k8sAuthDetail": k8s_auth["detail"],
+        "discoveryStale": k8s_auth["status"] != "ok" and len(services) > 0,
         "stats": {
             "services": len(services),
             "middlewares": len(middlewares),
@@ -99,6 +167,9 @@ async def build_home_overview(db: AsyncSession, profile: EnvironmentProfile | No
             "healthy": healthy,
             "degraded": degraded,
             "critical": critical,
+            "blueprintTotal": blueprint_total,
+            "blueprintFound": blueprint_found,
+            "blueprintMissing": blueprint_total - blueprint_found,
             "activeIncidents": active_incidents,
         },
         "architecture": {

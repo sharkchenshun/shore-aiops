@@ -2,7 +2,7 @@
 # app/services/environments.py — 多环境配置与当前环境切换
 # 配置：backend/config/environments.json
 # 当前环境：Redis platform:active_environment（默认读 JSON default）
-# K8s 凭证：KUBECONFIG 环境变量 → 启动时入库 clusters.kubeconfig
+# K8s 凭证：设置页粘贴 → clusters.kubeconfig（运行时只读 DB）
 # ============================================================
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ class EnvironmentProfile:
     es_port: int = 9200
     gitlab_ci_branches: list[str] = field(default_factory=list)
     argocd_server: str = ""
+    k8s_api_server: str = ""  # 可选：覆盖 kubeconfig 内 server（内网 IP，容器可访问）
     enabled: bool = True
 
     def to_public_dict(self) -> dict[str, Any]:
@@ -48,6 +49,7 @@ class EnvironmentProfile:
             "esHost": self.es_host,
             "gitlabCiBranches": self.gitlab_ci_branches,
             "argocdServer": self.argocd_server,
+            "k8sApiServer": self.k8s_api_server,
             "enabled": self.enabled,
         }
 
@@ -102,6 +104,7 @@ def load_environments_config() -> tuple[str, list[EnvironmentProfile]]:
             es_port=int(item.get("es_port") or 9200),
             gitlab_ci_branches=list(branches or []),
             argocd_server=str(item.get("argocd_server") or ""),
+            k8s_api_server=str(item.get("k8s_api_server") or "").strip(),
             enabled=bool(item.get("enabled", True)),
         ))
     if not profiles:
