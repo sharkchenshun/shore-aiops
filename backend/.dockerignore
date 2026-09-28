@@ -1,0 +1,12 @@
+.git
+__pycache__
+*.py[cod]
+.venv
+venv
+*.egg-info
+.env
+.env.secrets
+*.pem
+*.key
+.pytest_cache
+.mypy_cache

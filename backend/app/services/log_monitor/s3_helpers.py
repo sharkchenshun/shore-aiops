@@ -71,6 +71,60 @@ def latest_completed_4h_window_start(now: datetime.datetime) -> datetime.datetim
     return ws - datetime.timedelta(hours=4)
 
 
+def index_has_files(payload) -> bool:
+    """实时索引总会返回 dict；没有 files 时应回落到 S3 窗口索引。"""
+    return bool(isinstance(payload, dict) and (payload.get("files") or []))
+
+
+def virtual_raw_log_name(key: str) -> str | None:
+    """logs/.../raw/{ns}/{pod}/... → ns_pod_s3_recent.log。"""
+    marker = "/raw/"
+    idx = (key or "").find(marker)
+    if idx < 0:
+        return None
+    parts = key[idx + len(marker):].split("/")
+    if len(parts) < 4 or not parts[0] or not parts[1]:
+        return None
+    return f"{parts[0]}_{parts[1]}_s3_recent.log"
+
+
+def resolve_s3_recent_keys(task: MonitorTask, filename: str) -> list[str]:
+    """把 ns_pod_s3_recent.log 解析成当前窗口的原始 S3 key。"""
+    if not filename.endswith("_s3_recent.log"):
+        return []
+    s3_client = get_s3_client(task)
+    if not s3_client:
+        return []
+    from app.services.log_monitor.engine import _now
+
+    def _keys_from(payload) -> list[str]:
+        found: list[str] = []
+        if not index_has_files(payload):
+            return found
+        for f in payload["files"]:
+            key = f.get("name") or ""
+            if virtual_raw_log_name(key) == filename:
+                found.append(key)
+        return found
+
+    payload = None
+    try:
+        payload = monitor_engine.get_realtime_index_payload(task, "raw")
+    except Exception:
+        payload = None
+    keys = _keys_from(payload)
+    if not keys:
+        idx_key = index_s3_key(task, "raw", latest_completed_4h_window_start(_now()))
+        try:
+            obj = s3_client.get_object(Bucket=task.s3_bucket, Key=idx_key)
+            payload = json.loads(obj["Body"].read().decode("utf-8", errors="replace"))
+        except Exception:
+            payload = None
+        keys = _keys_from(payload)
+    keys.sort()
+    return keys
+
+
 def index_s3_key(task: MonitorTask, log_type: str, window_start: datetime.datetime) -> str:
     ws = _localtime(window_start)
     date_str = ws.date().isoformat()
@@ -112,7 +166,11 @@ def redact_task(task: MonitorTask) -> dict[str, Any]:
         "s3_archive_enabled": task.s3_archive_enabled,
         "s3_bucket": task.s3_bucket,
         "s3_region": task.s3_region,
-        "s3_access_key": f"****{task.s3_access_key[-4:]}" if task.s3_access_key and len(task.s3_access_key) >= 4 else ("****" if task.s3_access_key else None),
+        "s3_access_key": (
+            f"****{task.s3_access_key[-4:]}"
+            if task.s3_access_key and len(task.s3_access_key) > 8
+            else ("****" if task.s3_access_key else None)
+        ),
         "s3_secret_key": "",
         "s3_secret_key_set": bool(task.s3_secret_key),
         "s3_endpoint": task.s3_endpoint,
@@ -149,56 +207,62 @@ def list_log_files(task: MonitorTask, *, page=1, page_size=10, search="", sort_b
     local_files: list[dict] = []
 
     if s3_client:
-        lt = log_type if log_type in ('raw', 'error') else 'raw'
+        types = ('raw', 'error') if log_type not in ('raw', 'error') else (log_type,)
         ws = latest_completed_4h_window_start(_now())
-        payload = None
-        if realtime:
-            try:
-                payload = monitor_engine.get_realtime_index_payload(task, lt)
-            except Exception:
-                pass
-        if not payload:
-            idx_key = index_s3_key(task, lt, ws)
-            try:
-                obj = s3_client.get_object(Bucket=task.s3_bucket, Key=idx_key)
-                raw = obj['Body'].read().decode('utf-8', errors='replace')
-                payload = json.loads(raw)
-            except Exception as e:
-                if handle_s3_error(e, task, lambda t: None):
-                    s3_client = get_s3_client(task)
-                    try:
-                        obj = s3_client.get_object(Bucket=task.s3_bucket, Key=idx_key)
-                        raw = obj['Body'].read().decode('utf-8', errors='replace')
-                        payload = json.loads(raw)
-                    except Exception:
-                        pass
-        if payload and isinstance(payload.get('files'), list):
-            s3_files = payload['files']
-            aggregated: dict[str, dict] = {}
-            for f in s3_files:
-                key = f.get('name') or ''
-                if '/raw/' in key:
-                    try:
-                        idx = key.find('/raw/')
-                        rest = key[idx + 5:]
-                        p = rest.split('/')
-                        if len(p) >= 4:
-                            ns, pod = p[0], p[1]
-                            virtual_name = f"{ns}_{pod}_s3_recent.log"
-                            if virtual_name not in aggregated:
-                                aggregated[virtual_name] = {
-                                    "name": virtual_name, "size": 0, "mtime": 0,
-                                    "is_virtual": True, "s3_keys": [],
-                                }
-                            aggregated[virtual_name]['size'] += int(f.get('size') or 0)
-                            aggregated[virtual_name]['mtime'] = max(
-                                aggregated[virtual_name]['mtime'], float(f.get('mtime') or 0)
-                            )
-                            aggregated[virtual_name]['s3_keys'].append(key)
-                    except Exception:
-                        pass
-            if aggregated:
-                s3_files = list(aggregated.values())
+
+        def _load_index(lt: str) -> list[dict]:
+            nonlocal s3_client
+            payload = None
+            if realtime:
+                try:
+                    payload = monitor_engine.get_realtime_index_payload(task, lt)
+                except Exception:
+                    payload = None
+                if not index_has_files(payload):
+                    payload = None
+            if not index_has_files(payload):
+                idx_key = index_s3_key(task, lt, ws)
+                try:
+                    obj = s3_client.get_object(Bucket=task.s3_bucket, Key=idx_key)
+                    raw = obj['Body'].read().decode('utf-8', errors='replace')
+                    payload = json.loads(raw)
+                except Exception as e:
+                    if handle_s3_error(e, task, lambda t: None):
+                        s3_client = get_s3_client(task)
+                        if not s3_client:
+                            return []
+                        try:
+                            obj = s3_client.get_object(Bucket=task.s3_bucket, Key=idx_key)
+                            raw = obj['Body'].read().decode('utf-8', errors='replace')
+                            payload = json.loads(raw)
+                        except Exception:
+                            pass
+            if payload and isinstance(payload.get('files'), list):
+                return payload['files']
+            return []
+
+        for lt in types:
+            s3_files.extend(_load_index(lt))
+        aggregated: dict[str, dict] = {}
+        leftover: list[dict] = []
+        for f in s3_files:
+            key = f.get('name') or ''
+            virtual_name = virtual_raw_log_name(key)
+            if virtual_name:
+                if virtual_name not in aggregated:
+                    aggregated[virtual_name] = {
+                        "name": virtual_name, "size": 0, "mtime": 0,
+                        "is_virtual": True, "s3_keys": [],
+                    }
+                aggregated[virtual_name]['size'] += int(f.get('size') or 0)
+                aggregated[virtual_name]['mtime'] = max(
+                    aggregated[virtual_name]['mtime'], float(f.get('mtime') or 0)
+                )
+                aggregated[virtual_name]['s3_keys'].append(key)
+            else:
+                leftover.append(f)
+        if aggregated:
+            s3_files = list(aggregated.values()) + leftover
 
     log_dir = os.path.join(base_dir, str(task.id))
     if os.path.exists(log_dir):

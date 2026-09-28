@@ -17,7 +17,14 @@ def sanitize_http_url(raw: str | None) -> str:
     lowered = url.split(":", 1)[0].lower()
     if lowered in {"file", "javascript", "data", "gopher", "ftp", "unix", "mailto"}:
         raise ValueError("仅支持 http/https URL")
-    if not url.startswith(("http://", "https://")):
+    low = url.lower()
+    if low.startswith("https://"):
+        url = "https://" + url[8:]
+    elif low.startswith("http://"):
+        url = "http://" + url[7:]
+    elif "://" in url.split("/", 1)[0]:
+        raise ValueError("仅支持 http/https URL")
+    else:
         url = "http://" + url
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -40,7 +47,7 @@ def url_host(raw: str | None) -> str:
 
 
 def _url_authority(raw: str | None) -> str:
-    """hostname:port，缺省端口按 http=80 / https=443。凭据绑定必须连端口一起比。"""
+    """hostname:port。缺省端口按 http=80 / https=443。只比主机和端口，避免 https 配成 host:9090 时丢鉴权。"""
     try:
         url = sanitize_http_url(raw)
     except ValueError:
@@ -54,7 +61,7 @@ def _url_authority(raw: str | None) -> str:
     port = parsed.port
     if port is None:
         port = 443 if parsed.scheme == "https" else 80
-    return f"{parsed.scheme}://{host}:{port}"
+    return f"{host}:{port}"
 
 
 def hosts_match(left: str | None, right: str | None) -> bool:

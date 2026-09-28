@@ -1,6 +1,6 @@
 'use client'
 
-import { Suspense, useCallback, useEffect, useMemo, useState } from 'react'
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'next/navigation'
 import {
   FileText, Loader2, Plus, RefreshCw, Search, Settings2, Trash2, WifiOff, ChevronLeft, ChevronRight, Download, History,
@@ -97,6 +97,11 @@ function textToLines(v: string) {
   return v.split('\n').map((s) => s.trim()).filter(Boolean)
 }
 
+function toLocalInput(d: Date) {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
 export default function LogsPage() {
   return (
     <Suspense fallback={
@@ -111,7 +116,7 @@ export default function LogsPage() {
 
 function LogsPageContent() {
   const searchParams = useSearchParams()
-  const { active: activeEnv } = useEnvironments()
+  const { active: activeEnv, environments } = useEnvironments()
   const [tasks, setTasks] = useState<MonitorTask[]>([])
   const [showAllEnvs, setShowAllEnvs] = useState(false)
   const [loading, setLoading] = useState(true)
@@ -194,7 +199,7 @@ function LogsPageContent() {
         page_size: String(CONTENT_PAGE_SIZE),
         reverse: 'true',
       })
-      if (kw) params.set('keyword', kw)
+      if (kw?.trim()) params.set('keyword', kw.trim())
       const data = await apiJson<{
         content?: string
         error?: string
@@ -217,7 +222,17 @@ function LogsPageContent() {
   useEffect(() => { loadTasks() }, [loadTasks, activeEnv])
 
   useEffect(() => {
+    if (selected) loadFiles(selected, 1)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅在切换日志类型时刷新列表
+  }, [logType])
+
+  const taskIdParam = searchParams.get('taskId')
+  const filenameParam = searchParams.get('filename')
+  const deepLinkKey = useRef('')
+
+  useEffect(() => {
     if (!selected || showAllEnvs) return
+    if (taskIdParam && selected.id === taskIdParam) return
     const env = activeEnv || 'test'
     if ((selected.environment_id || 'test') !== env) {
       setSelected(null)
@@ -225,19 +240,21 @@ function LogsPageContent() {
       setContent('')
       setActiveFile(null)
     }
-  }, [activeEnv, showAllEnvs, selected])
+  }, [activeEnv, showAllEnvs, selected, taskIdParam])
 
   useEffect(() => {
-    const taskId = searchParams.get('taskId')
-    const filename = searchParams.get('filename')
-    if (!taskId || tasks.length === 0) return
-    const task = tasks.find((t) => t.id === taskId)
+    if (!taskIdParam || tasks.length === 0) return
+    const key = `${taskIdParam}:${filenameParam || ''}`
+    if (deepLinkKey.current === key) return
+    const task = tasks.find((t) => t.id === taskIdParam)
     if (!task) return
+    deepLinkKey.current = key
     setSelected(task)
     loadFiles(task, 1).then(() => {
-      if (filename) viewLog(task, filename, 1)
+      if (filenameParam) viewLog(task, filenameParam, 1)
     })
-  }, [searchParams, tasks, loadFiles, viewLog])
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- Slack 深链只消费一次，避免刷新任务列表把选中项弹回去
+  }, [taskIdParam, filenameParam, tasks])
 
   const selectTask = async (task: MonitorTask) => {
     setSelected(task)
@@ -277,7 +294,12 @@ function LogsPageContent() {
       if (!payload.k8s_kubeconfig) delete payload.k8s_kubeconfig
       if (!payload.s3_secret_key) delete payload.s3_secret_key
       if (typeof payload.s3_access_key === 'string' && payload.s3_access_key.startsWith('****')) delete payload.s3_access_key
-      if (typeof payload.slack_webhook_url === 'string' && payload.slack_webhook_url.startsWith('•')) delete payload.slack_webhook_url
+      if (
+        !payload.slack_webhook_url
+        || (typeof payload.slack_webhook_url === 'string' && payload.slack_webhook_url.startsWith('•'))
+      ) {
+        delete payload.slack_webhook_url
+      }
       const isEdit = Boolean(draft.id)
       await apiJson(
         isEdit ? `/api/monitor/tasks/${draft.id}` : '/api/monitor/tasks',
@@ -324,8 +346,8 @@ function LogsPageContent() {
   const openHistory = () => {
     const end = new Date()
     const start = new Date(end.getTime() - 7 * 24 * 3600 * 1000)
-    setHistoryStart(start.toISOString().slice(0, 16))
-    setHistoryEnd(end.toISOString().slice(0, 16))
+    setHistoryStart(toLocalInput(start))
+    setHistoryEnd(toLocalInput(end))
     setHistoryItems([])
     setHistoryDetail([])
     setShowHistory(true)
@@ -493,8 +515,8 @@ function LogsPageContent() {
                     placeholder="内容关键词..."
                     className="text-xs px-3 py-1.5 rounded-lg bg-shark-card border border-shark-border text-white w-36"
                   />
-                  {activeFile && keyword && (
-                    <button onClick={() => viewLog(selected, activeFile, 1, keyword)} className="text-xs px-3 py-1.5 rounded bg-shark-accent/20 text-shark-accent">搜索内容</button>
+                  {activeFile && keyword.trim() && (
+                    <button onClick={() => viewLog(selected, activeFile, 1, keyword.trim())} className="text-xs px-3 py-1.5 rounded bg-shark-accent/20 text-shark-accent">搜索内容</button>
                   )}
                   {activeFile && (
                     <button onClick={() => downloadLog(selected, activeFile)} className="text-xs px-3 py-1.5 rounded border border-shark-border text-shark-muted hover:text-white flex items-center gap-1">
@@ -555,7 +577,7 @@ function LogsPageContent() {
                       <div className="flex items-center gap-2">
                         <button
                           disabled={contentPage <= 1 || contentLoading}
-                          onClick={() => selected && activeFile && viewLog(selected, activeFile, contentPage - 1, keyword || undefined)}
+                          onClick={() => selected && activeFile && viewLog(selected, activeFile, contentPage - 1, keyword.trim() || undefined)}
                           className="p-1 disabled:opacity-30 hover:text-white"
                         >
                           <ChevronLeft size={14} />
@@ -563,7 +585,7 @@ function LogsPageContent() {
                         <span>第 {contentPage}/{contentTotalPages} 页</span>
                         <button
                           disabled={contentPage >= contentTotalPages || contentLoading}
-                          onClick={() => selected && activeFile && viewLog(selected, activeFile, contentPage + 1, keyword || undefined)}
+                          onClick={() => selected && activeFile && viewLog(selected, activeFile, contentPage + 1, keyword.trim() || undefined)}
                           className="p-1 disabled:opacity-30 hover:text-white"
                         >
                           <ChevronRight size={14} />
@@ -620,12 +642,24 @@ function LogsPageContent() {
               </div>
               <div className="border border-shark-border rounded-lg max-h-64 overflow-auto">
                 {historyDetail.length === 0 && <p className="text-xs text-shark-muted p-3">选择左侧索引查看文件</p>}
-                {historyDetail.map((f, i) => (
-                  <div key={f.key || f.name || i} className="px-3 py-2 text-xs border-b border-shark-border/50 flex justify-between">
-                    <span className="text-white truncate">{f.name || f.key}</span>
-                    <span className="text-shark-muted shrink-0 ml-2">{fmtSize(f.size)}</span>
-                  </div>
-                ))}
+                {historyDetail.map((f, i) => {
+                  const name = f.name || f.key
+                  return (
+                    <button
+                      key={name || i}
+                      type="button"
+                      onClick={() => {
+                        if (!name || !selected) return
+                        setShowHistory(false)
+                        viewLog(selected, name, 1)
+                      }}
+                      className="w-full text-left px-3 py-2 text-xs border-b border-shark-border/50 hover:bg-white/[0.03] flex justify-between gap-2"
+                    >
+                      <span className="text-white truncate">{name}</span>
+                      <span className="text-shark-muted shrink-0">{fmtSize(f.size)}</span>
+                    </button>
+                  )
+                })}
               </div>
             </div>
             <div className="flex justify-end">
@@ -642,8 +676,9 @@ function LogsPageContent() {
             <Field label="名称"><input value={draft.name || ''} onChange={(e) => setDraft({ ...draft, name: e.target.value })} className="input-field" /></Field>
             <Field label="环境">
               <select value={draft.environment_id || 'test'} onChange={(e) => setDraft({ ...draft, environment_id: e.target.value })} className="input-field">
-                <option value="dev">dev（K8s context: dev）</option>
-                <option value="test">test（K8s context: test）</option>
+                {(environments.length ? environments : [{ id: 'dev', label: 'dev' }, { id: 'test', label: 'test' }]).map((env) => (
+                  <option key={env.id} value={env.id}>{env.id}{env.label && env.label !== env.id ? `（${env.label}）` : ''}</option>
+                ))}
               </select>
             </Field>
             <Field label="K8s 命名空间（逗号分隔）"><input value={draft.k8s_namespace || ''} onChange={(e) => setDraft({ ...draft, k8s_namespace: e.target.value })} className="input-field" /></Field>

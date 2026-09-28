@@ -1,0 +1,26 @@
+# 前端 build context 是仓库根目录。不把后端 / git / 依赖打进 Next 镜像。
+.git
+.cursor
+**/.DS_Store
+
+node_modules
+.next
+out
+tsconfig.tsbuildinfo
+
+backend
+docs
+ci-configs
+scripts
+agent-transcripts
+
+**/__pycache__
+**/*.pyc
+**/.venv
+**/*.egg-info
+
+.env
+.env.*
+!.env.example
+**/*.pem
+**/*.key
