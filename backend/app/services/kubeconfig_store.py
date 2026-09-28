@@ -76,7 +76,7 @@ def k8s_config_from_content(content: str | None) -> dict[str, Any]:
 
 @lru_cache(maxsize=1)
 def _sync_session_factory() -> sessionmaker | None:
-    url = (settings.DATABASE_URL_SYNC or "").strip()
+    url = settings.sync_database_url
     if not url:
         return None
     engine = create_engine(url, pool_pre_ping=True)
@@ -179,16 +179,22 @@ def _client_cert_expiry_hint(data: dict) -> str:
     return ""
 
 
+def core_v1_from_kubeconfig_dict(data: dict):
+    """独立 Configuration，避免改进程默认 kubeconfig（设置页探测和采集线程会并发）。"""
+    from kubernetes import client as k8s_client
+    from kubernetes import config as k8s_config
+
+    configuration = k8s_client.Configuration()
+    k8s_config.load_kube_config_from_dict(data, client_configuration=configuration)
+    return k8s_client.CoreV1Api(k8s_client.ApiClient(configuration))
+
+
 def _verify_kubeconfig_connection(data: dict) -> None:
     try:
-        from kubernetes import client as k8s_client
-        from kubernetes import config as k8s_config
+        api = core_v1_from_kubeconfig_dict(data)
+        api.list_namespace(limit=1, _request_timeout=10)
     except ImportError as exc:
         raise ValueError("kubernetes 包未安装，无法校验 kubeconfig") from exc
-    try:
-        k8s_config.load_kube_config_from_dict(data)
-        api = k8s_client.CoreV1Api()
-        api.list_namespace(limit=1, _request_timeout=10)
     except Exception as exc:  # noqa: BLE001
         err = str(exc)
         cert_hint = _client_cert_expiry_hint(data)
@@ -220,7 +226,10 @@ def any_cluster_kubeconfig_configured_sync() -> bool:
 def check_cluster_kubeconfig_auth_sync(cluster_name: str) -> dict[str, str]:
     if settings.K8S_IN_CLUSTER:
         return {"status": "ok", "detail": "in_cluster"}
-    content = get_cluster_kubeconfig_sync(cluster_name)
+    try:
+        content = get_cluster_kubeconfig_sync(cluster_name)
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "detail": str(exc)[:200]}
     if not content:
         return {"status": "missing", "detail": "未配置 kubeconfig，请在 设置 → K8s 集群凭证 粘贴"}
     try:

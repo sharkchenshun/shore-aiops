@@ -29,10 +29,6 @@ async def init_db():
             "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS optimization_tips TEXT DEFAULT ''",
             "ALTER TABLE monitor_tasks ADD COLUMN IF NOT EXISTS environment_id VARCHAR(32) DEFAULT 'test'",
             "ALTER TABLE clusters ADD COLUMN IF NOT EXISTS kubeconfig TEXT",
-            "UPDATE monitor_tasks SET alert_threshold_count = 1 WHERE alert_threshold_count > 1",
-            "UPDATE monitor_tasks SET alert_silence_minutes = 15 WHERE alert_silence_minutes >= 60",
-            "UPDATE monitor_tasks SET alert_state = '{}'::jsonb WHERE alert_state IS NOT NULL AND alert_state::text NOT IN ('{}', 'null')",
-            "UPDATE monitor_tasks SET enabled = false WHERE environment_id = 'dev' AND name = 'test'",
         ):
             await conn.execute(text(stmt))
     logger.info("bootstrap.tables.created")

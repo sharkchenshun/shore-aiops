@@ -20,8 +20,12 @@ _SessionLocal = None
 def _ensure_engine():
     global _sync_engine, _SessionLocal
     if _sync_engine is None:
-        _sync_engine = create_engine(settings.DATABASE_URL_SYNC, pool_pre_ping=True)
-        _SessionLocal = sessionmaker(bind=_sync_engine, expire_on_commit=False)
+        _sync_engine = create_engine(settings.sync_database_url, pool_pre_ping=True)
+        _SessionLocal = sessionmaker(
+            bind=_sync_engine,
+            expire_on_commit=False,
+            expire_on_close=False,
+        )
 
 
 def get_session() -> Session:
@@ -31,12 +35,18 @@ def get_session() -> Session:
 
 def get_enabled_tasks() -> list[MonitorTask]:
     with get_session() as db:
-        return list(db.scalars(select(MonitorTask).where(MonitorTask.enabled.is_(True))).all())
+        rows = list(db.scalars(select(MonitorTask).where(MonitorTask.enabled.is_(True))).all())
+        for row in rows:
+            db.expunge(row)
+        return rows
 
 
 def get_task(task_id: UUID | str) -> MonitorTask | None:
     with get_session() as db:
-        return db.get(MonitorTask, task_id)
+        row = db.get(MonitorTask, task_id)
+        if row is not None:
+            db.expunge(row)
+        return row
 
 
 def refresh_task(task: MonitorTask, fields: Iterable[str] | None = None) -> MonitorTask:
@@ -52,9 +62,19 @@ def refresh_task(task: MonitorTask, fields: Iterable[str] | None = None) -> Moni
 
 def save_task(task: MonitorTask, fields: Iterable[str] | None = None) -> None:
     with get_session() as db:
+        names = list(fields) if fields else None
+        if names:
+            persistent = db.get(MonitorTask, task.id)
+            if persistent is None:
+                return
+            for f in names:
+                if hasattr(task, f):
+                    setattr(persistent, f, getattr(task, f))
+            db.commit()
+            for f in names:
+                if hasattr(persistent, f):
+                    setattr(task, f, getattr(persistent, f))
+            return
         merged = db.merge(task)
         db.commit()
-        if fields:
-            for f in fields:
-                if hasattr(merged, f):
-                    setattr(task, f, getattr(merged, f))
+        db.expunge(merged)

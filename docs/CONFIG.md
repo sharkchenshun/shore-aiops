@@ -29,8 +29,8 @@
 
 | 变量 | 必填 | 说明 |
 |------|:----:|------|
-| `DATABASE_URL` | 是 | 异步连接串，`postgresql+asyncpg://...` |
-| `DATABASE_URL_SYNC` | 是 | 同步连接串（迁移、部分脚本） |
+| `DATABASE_URL` | 是 | 异步连接串，`postgresql+asyncpg://...`（不要填 psycopg2） |
+| `DATABASE_URL_SYNC` | 是 | 同步连接串，`postgresql+psycopg2://...`（不要填裸 `postgresql://`，SQLAlchemy 2.1 会走 psycopg3） |
 | `REDIS_URL` | 是 | 默认 `redis://localhost:6379/0` |
 
 docker compose 自带 postgres/redis，生产建议用托管实例。

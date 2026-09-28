@@ -77,7 +77,7 @@ def _merge_log_context(*chunks: str) -> str:
             stripped = line.strip()
             if not stripped or re.match(r"^-{10,}$", stripped):
                 continue
-            key = _clean_log_line(stripped) or stripped
+            key = clean_log_line(stripped) or stripped
             if key in seen:
                 continue
             seen.add(key)
@@ -283,15 +283,17 @@ class MonitorEngine:
                     to_finalize.append(ws)
 
         for ws in sorted(to_finalize):
-            self._upload_index_file(task, s3_client, 'raw', ws)
-            self._upload_index_file(task, s3_client, 'error', ws)
+            raw_ok = self._upload_index_file(task, s3_client, 'raw', ws)
+            err_ok = self._upload_index_file(task, s3_client, 'error', ws)
+            if not (raw_ok and err_ok):
+                continue
             with self._index_lock:
                 by_task = self._index_entries.get(tid) or {}
                 by_task.pop(ws.isoformat(), None)
                 if not by_task:
                     self._index_entries.pop(tid, None)
 
-    def _upload_index_file(self, task, s3_client, log_type: str, window_start):
+    def _upload_index_file(self, task, s3_client, log_type: str, window_start) -> bool:
         tid = str(task.id)
         ws = _localtime(window_start)
         we = ws + datetime.timedelta(hours=4) - datetime.timedelta(seconds=1)
@@ -322,8 +324,10 @@ class MonitorEngine:
                 Body=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
                 ContentType='application/json; charset=utf-8'
             )
-        except Exception:
-            pass
+            return True
+        except Exception as e:
+            logger.warning("upload index failed task=%s key=%s error=%s", tid, key, str(e)[:200])
+            return False
 
     def get_realtime_index_payload(self, task, log_type: str):
         tid = str(getattr(task, 'id', '') or '')
@@ -452,11 +456,12 @@ class MonitorEngine:
                             self._process_task(task)
                             task.last_run = now
                             task.last_error = "" # clear error on success
-                            task_store.save_task(task, ['last_run', 'last_error', 'alerts_sent_count'])
+                            task_store.save_task(task, ['last_run', 'last_error'])
                         except Exception as e:
                             logger.error(f"Error processing task {task.name}: {e}")
                             task.last_error = str(e)[:500]
-                            task_store.save_task(task, ['last_error'])
+                            task.last_run = now
+                            task_store.save_task(task, ['last_error', 'last_run'])
 
                     try:
                         self._finalize_due_indexes(task)
@@ -474,6 +479,7 @@ class MonitorEngine:
         try:
             task = task_store.refresh_task(task, [
                 'enabled',
+                'environment_id',
                 'k8s_namespace',
                 'k8s_kubeconfig',
                 'alert_enabled',
@@ -510,17 +516,22 @@ class MonitorEngine:
             raise ImportError("kubernetes package not installed")
 
         import yaml
+        from app.services.environments import get_profile
+        from app.services.kubeconfig_store import apply_api_server_override, core_v1_from_kubeconfig_dict
 
         if task.k8s_kubeconfig:
-            k8s_config.load_kube_config_from_dict(yaml.safe_load(task.k8s_kubeconfig))
+            data = yaml.safe_load(task.k8s_kubeconfig)
         else:
             try:
                 k8s_config.load_incluster_config()
+                return client.CoreV1Api()
             except Exception:
-                content = self._kubeconfig_content_for_task(task)
-                k8s_config.load_kube_config_from_dict(yaml.safe_load(content))
-
-        return client.CoreV1Api()
+                data = yaml.safe_load(self._kubeconfig_content_for_task(task))
+        if not isinstance(data, dict):
+            raise ValueError("invalid kubeconfig")
+        profile = get_profile(getattr(task, "environment_id", None) or "test")
+        data = apply_api_server_override(data, profile)
+        return core_v1_from_kubeconfig_dict(data)
 
     def _fetch_pod_log_tail(self, task, namespace, pod_name, container_name, tail_lines=DEFAULT_TAIL_LINES):
         """告警时重新拉取 Pod 日志尾部，获取完整堆栈。"""
@@ -568,6 +579,7 @@ class MonitorEngine:
         os.makedirs(task_log_dir, exist_ok=True)
 
         ns_errors: list[str] = []
+        log_errors: list[str] = []
         pods_processed = 0
 
         for namespace in namespaces:
@@ -640,13 +652,15 @@ class MonitorEngine:
                         )
                         
                 except Exception as e:
-                    # logger.warning(f"Failed to read log for {pod_name}: {e}")
-                    pass
+                    err = f"{namespace}/{pod_name}: {e}"
+                    logger.warning("Failed to read log for %s: %s", pod_name, e)
+                    log_errors.append(err)
                 else:
                     pods_processed += 1
 
-        if ns_errors and pods_processed == 0:
-            msg = "; ".join(ns_errors)
+        fetch_errors = ns_errors + log_errors
+        if fetch_errors and pods_processed == 0:
+            msg = "; ".join(fetch_errors)
             if "401" in msg or "Unauthorized" in msg:
                 raise RuntimeError(
                     f"K8s 凭证失效 ({msg})，请在 设置 → K8s 集群凭证 更新 {getattr(task, 'environment_id', 'dev')} 环境 kubeconfig"
@@ -903,7 +917,7 @@ class MonitorEngine:
                     log_file_handle.write(line)
 
                 # --- Analysis Logic Per Line ---
-                if any(k in line for k in clean_ignore_keywords):
+                if any(k.lower() in line.lower() for k in clean_ignore_keywords):
                     continue
 
                 app_level = _extract_level(line)
@@ -953,6 +967,7 @@ class MonitorEngine:
                 
                 # 1. Immediate Alerts
                 is_alert = False
+                alerts_before_line = len(alerts)
                 if clean_immediate_keywords:
                     for k in clean_immediate_keywords:
                         if immediate_keyword_matches_line(k, line):
@@ -1000,34 +1015,15 @@ class MonitorEngine:
                 # 4. Record Only (and Suppress Alert)
                 is_record = False
                 if clean_record_keywords:
-                     if any(k in line for k in clean_record_keywords):
+                     if any(k.lower() in line.lower() for k in clean_record_keywords):
                          is_record = True
                          
                          # CRITICAL FIX: If matched Record Only, remove any alerts generated by this line
                          # This allows "muting" specific errors that match general Alert keywords (like 'error')
                          # but shouldn't trigger Slack notifications.
                          if is_alert:
-                             # Remove alerts added in step 1 & 2 for this line
-                             # We can check the last added alerts or filter the whole list?
-                             # Since we are processing line by line, the alerts for THIS line are added just now.
-                             # But 'alerts' is a list for the whole stream/batch.
-                             # We need to know which alerts correspond to THIS line.
-                             # The alert dict has 'msg' which contains the line.
-                             # Let's filter out alerts that contain this line text AND were just added?
-                             # Simpler: Filter alerts list at the end of loop iteration? 
-                             # No, alerts is accumulated for the whole pod stream.
-                             
-                             # Let's remove alerts where msg contains this line content.
-                             # Be careful not to remove duplicates if same line appeared before?
-                             # But here we are inside the loop for THIS line.
-                             
-                             # Actually, simpler way:
-                             # Don't add to alerts if it matches record keywords?
-                             # But we already added them in Step 1 & 2.
-                             
-                             # So let's remove them now.
-                             alerts = [a for a in alerts if a['msg'].find(line) == -1]
-                             is_alert = False # Reset flag so it doesn't prefix [ALERT] in log file
+                             alerts = alerts[:alerts_before_line]
+                             is_alert = False
 
                 if stack_capture_active and not is_stack_line:
                     stack_capture_active = False
@@ -1519,8 +1515,9 @@ class MonitorEngine:
             
             # Perform Delete
             if should_delete:
-                # If s3_client missing but should_archive=True (retention), we just delete (data loss but intended by retention)
-                # If s3_client present, we only delete if upload succeeded (continue above handles failure)
+                # 跨日删除的前提是已经归档到 S3。没有客户端时只按保留天数删，避免本地日志隔夜被清空。
+                if not s3_client and file_date > retention_date:
+                    continue
                 try:
                     os.remove(fp)
                 except Exception:

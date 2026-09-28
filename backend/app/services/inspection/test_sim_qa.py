@@ -337,3 +337,49 @@ class CrossDirectionTests(unittest.TestCase):
                 self.assertEqual(virtual_raw_log_name(f"logs/monitor/{tid}/raw/ns/p/2026/x.log"), "ns_p_s3_recent.log")
                 self.assertIsNone(_keyword_terms("  "))
                 self.assertEqual(sanitize_http_url("HTTPS://prom:9090"), "https://prom:9090")
+
+
+class PersistenceGuardTests(unittest.TestCase):
+    def test_success_loop_does_not_save_alert_count(self):
+        tree = ast.parse((_APP / "services/log_monitor/engine.py").read_text(encoding="utf-8"))
+        found = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or getattr(node.func, "attr", "") != "save_task":
+                continue
+            if len(node.args) < 2 or not isinstance(node.args[1], ast.List):
+                continue
+            fields = [elt.value for elt in node.args[1].elts if isinstance(elt, ast.Constant)]
+            if "last_run" in fields:
+                found = True
+                self.assertNotIn("alerts_sent_count", fields)
+        self.assertTrue(found)
+
+    def test_bootstrap_does_not_reset_alert_settings(self):
+        src = (_APP / "bootstrap.py").read_text(encoding="utf-8")
+        self.assertNotIn("alert_threshold_count = 1 WHERE", src)
+        self.assertNotIn("alert_silence_minutes = 15 WHERE", src)
+        self.assertNotIn("alert_state = '{}'", src)
+
+    def test_slack_merge_uses_imported_clean_log_line(self):
+        src = (_APP / "services/log_monitor/engine.py").read_text(encoding="utf-8")
+        self.assertIn("key = clean_log_line(stripped)", src)
+        self.assertNotIn("key = _clean_log_line(", src)
+
+    def test_record_only_does_not_substring_drop_other_alerts(self):
+        src = (_APP / "services/log_monitor/engine.py").read_text(encoding="utf-8")
+        self.assertNotIn("a['msg'].find(line)", src)
+        self.assertIn("alerts = alerts[:alerts_before_line]", src)
+
+    def test_index_upload_failure_keeps_memory(self):
+        src = (_APP / "services/log_monitor/engine.py").read_text(encoding="utf-8")
+        self.assertIn("if not (raw_ok and err_ok):", src)
+        self.assertIn("return False", src)
+
+    def test_pod_log_read_failure_is_not_silent_success(self):
+        src = (_APP / "services/log_monitor/engine.py").read_text(encoding="utf-8")
+        self.assertIn("log_errors.append(err)", src)
+        self.assertIn("fetch_errors = ns_errors + log_errors", src)
+
+    def test_local_rotate_does_not_delete_before_retention_without_s3(self):
+        src = (_APP / "services/log_monitor/engine.py").read_text(encoding="utf-8")
+        self.assertIn("if not s3_client and file_date > retention_date:", src)

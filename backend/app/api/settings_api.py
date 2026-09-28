@@ -4,6 +4,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
+import asyncio
 
 from app.core.deps import get_request_environment, require_admin, require_user
 from app.models.auth import User
@@ -41,11 +42,19 @@ async def list_environments(
     _user: User = Depends(require_user),
 ):
     active = get_active_env_id()
+    profiles = list_profiles()
+    if profiles:
+        configured = [await cluster_has_kubeconfig(db, p) for p in profiles]
+        auths = await asyncio.gather(*[
+            asyncio.to_thread(check_cluster_kubeconfig_auth_sync, p.cluster_name)
+            for p in profiles
+        ])
+    else:
+        configured, auths = [], []
     envs = []
-    for p in list_profiles():
+    for p, ok, auth in zip(profiles, configured, auths):
         d = p.to_public_dict()
-        d["kubeconfigConfigured"] = await cluster_has_kubeconfig(db, p)
-        auth = check_cluster_kubeconfig_auth_sync(p.cluster_name)
+        d["kubeconfigConfigured"] = ok
         d["kubeconfigStatus"] = auth["status"]
         d["kubeconfigDetail"] = auth["detail"]
         envs.append(d)

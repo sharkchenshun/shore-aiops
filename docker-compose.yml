@@ -46,7 +46,7 @@ services:
       - ./backend/.env.secrets
     environment:
       DATABASE_URL: postgresql+asyncpg://bestnative:bestnative@postgres:5432/bestnative
-      DATABASE_URL_SYNC: postgresql://bestnative:bestnative@postgres:5432/bestnative
+      DATABASE_URL_SYNC: postgresql+psycopg2://bestnative:bestnative@postgres:5432/bestnative
       REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"

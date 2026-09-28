@@ -682,7 +682,7 @@ class InspectionEngine:
 
         # 2. AI Analysis
         log("inspection", "Starting AI analysis...")
-        ai_analysis = "AI analysis failed or not configured."
+        ai_analysis = ""
         
         if self._ai_key():
             prompt = json.dumps({
