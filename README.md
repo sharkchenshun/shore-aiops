@@ -44,7 +44,7 @@ Alertmanager → 事件入库 → DiagnosisAgent(RAG + ReAct) → AnalysisReport
 | Pod 管理 | `/pods` | 命名空间 Pod、日志 |
 | 发布管理 | `/deployments` | CI 扫描、构建分析、回滚 |
 | 日志监控 | `/logs` | 关键字匹配、Slack 告警 |
-| 监控巡检 | `/monitoring` | 定时巡检、Prometheus 异常 |
+| 监控巡检 | `/monitoring` | Prometheus 集群清单巡检、PVC/工作负载、每日 08:00 |
 | 成本分析 | `/cost` | 资源成本、缩容建议 |
 | 值班排班 | `/schedules` | 排班、近期值班 |
 | 运维助手 | `/copilot` | ReAct 对话 |

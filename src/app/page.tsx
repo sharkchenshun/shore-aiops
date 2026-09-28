@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, type ComponentType } from 'react'
 import Link from 'next/link'
 import { AlertTriangle, DollarSign, Layers, Rocket, Server } from 'lucide-react'
 import { apiJson } from '@/lib/api'
@@ -67,6 +67,7 @@ export default function DashboardPage() {
           <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-3">
             <QuickLink href="/deployments" label="发布管理" desc="构建状态 · 回滚" />
             <QuickLink href="/logs" label="日志监控" desc="关键字告警" />
+            <QuickLink href="/monitoring" label="监控巡检" desc="集群清单 · 报告" />
             <QuickLink href="/incidents" label="事件中心" desc="告警 · 诊断" />
             <QuickLink href="/copilot" label="运维助手" desc="对话查环境" />
           </div>
@@ -79,7 +80,7 @@ export default function DashboardPage() {
 }
 
 function KpiCard({ icon: Icon, label, value, sub, accent, href }: {
-  icon: React.ComponentType<{ size?: number | string; className?: string }>
+  icon: ComponentType<{ size?: number | string; className?: string }>
   label: string; value: string | number; sub: string; accent?: boolean; href?: string
 }) {
   const inner = (

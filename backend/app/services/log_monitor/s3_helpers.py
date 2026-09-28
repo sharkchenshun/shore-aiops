@@ -8,6 +8,7 @@ import codecs
 import datetime
 import json
 import os
+import re
 from typing import Any
 from uuid import UUID
 
@@ -38,9 +39,11 @@ def get_s3_client(task: MonitorTask):
 
 
 def task_s3_prefixes(task: MonitorTask) -> list[str]:
+    """只允许读本任务目录。任务名不得作为 logs/monitor/ 的前缀，否则可跨任务读日志。"""
     prefixes = [f"logs/monitor/{task.id}/"]
-    if task.name:
-        prefixes.append(f"logs/{task.name}/")
+    name = (task.name or "").strip()
+    if name and re.fullmatch(r"[A-Za-z0-9._-]{1,100}", name) and name.lower() != "monitor":
+        prefixes.append(f"logs/{name}/")
     return prefixes
 
 

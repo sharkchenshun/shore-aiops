@@ -376,6 +376,7 @@ flowchart TD
 | 安全扫描 | `0 3 * * *` | SecurityAgent | 全平台漏洞扫描 |
 | GitLab CI | 120s | gitlab_ci_scanner | Pipeline 状态同步 |
 | 日志监控 | 持续 | log_monitor engine | 关键字匹配 → Slack |
+| 集群巡检 | `0 8 * * *` | inspection engine | Prometheus 清单 / PVC / 工作负载 |
 
 ### 8.4 Coordinator 编排流水线
 
@@ -454,6 +455,7 @@ erDiagram
 | `/api/knowledge` | 知识库 | 混合检索 |
 | `/api/security` | 安全 | 扫描任务 |
 | `/api/monitor` | 日志监控 | 任务配置、日志查询 |
+| `/api/inspection` | 集群巡检 | 配置、立即巡检、报告、忽略项 |
 | `/api/settings` | 设置 | 集成健康检查、维护窗口 |
 | `/api/home` | 首页 | 业务架构总览 |
 

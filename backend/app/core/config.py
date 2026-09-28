@@ -138,6 +138,10 @@ class Settings(BaseSettings):
     LOG_MONITOR_VIEW_MAX_PAGE_SIZE: int = 2000   # API 单页最大行数
     PUBLIC_URL: str = "http://localhost:3456"  # Slack 告警 deep link
 
+    # ---- System Inspection (合并自 shark-Platform inspection) ----
+    INSPECTION_ENABLED: bool = True
+    INSPECTION_CRON: str = "0 8 * * *"   # 每日 08:00
+
     # ---- Ops Agents ----
     MONITOR_PATROL_ENABLED: bool = True
     MONITOR_PATROL_INTERVAL: int = 900       # 秒，默认 15 分钟

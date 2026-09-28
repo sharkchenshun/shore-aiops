@@ -8,6 +8,7 @@ import datetime
 import json
 import math
 import os
+import re
 from collections import deque
 from uuid import UUID
 
@@ -18,9 +19,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.deps import require_operator, require_user
+from app.models.auth import User
 from app.models.monitor import MonitorTask
 from app.schemas.monitor import BatchSearchRequest, MonitorTaskCreate, MonitorTaskUpdate
-from app.services.log_monitor.engine import monitor_engine
 from app.services.log_monitor.s3_helpers import (
     get_s3_client,
     handle_s3_error,
@@ -36,6 +38,20 @@ from app.services.log_monitor.engine import _make_aware, _now, monitor_engine
 router = APIRouter(prefix="/monitor", tags=["monitor"])
 
 
+def _safe_local_log_path(log_dir: str, filename: str) -> str | None:
+    if not filename or os.path.sep in filename or ".." in filename:
+        return None
+    base = os.path.realpath(log_dir)
+    path = os.path.realpath(os.path.join(base, filename))
+    if path != base and not path.startswith(base + os.sep):
+        return None
+    return path if os.path.isfile(path) else None
+
+
+def _download_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name)[:180] or "log.log"
+
+
 async def _get_task(db: AsyncSession, task_id: UUID) -> MonitorTask:
     task = (await db.execute(select(MonitorTask).where(MonitorTask.id == task_id))).scalar_one_or_none()
     if task is None:
@@ -44,13 +60,13 @@ async def _get_task(db: AsyncSession, task_id: UUID) -> MonitorTask:
 
 
 @router.get("/tasks")
-async def list_tasks(db: AsyncSession = Depends(get_db)):
+async def list_tasks(db: AsyncSession = Depends(get_db), _user: User = Depends(require_user)):
     rows = (await db.execute(select(MonitorTask).order_by(MonitorTask.created_at.desc()))).scalars().all()
     return [redact_task(t) for t in rows]
 
 
 @router.post("/tasks")
-async def create_task(body: MonitorTaskCreate, db: AsyncSession = Depends(get_db)):
+async def create_task(body: MonitorTaskCreate, db: AsyncSession = Depends(get_db), _user: User = Depends(require_operator)):
     task = MonitorTask(**body.model_dump())
     db.add(task)
     await db.flush()
@@ -59,12 +75,12 @@ async def create_task(body: MonitorTaskCreate, db: AsyncSession = Depends(get_db
 
 
 @router.get("/tasks/{task_id}")
-async def get_task(task_id: UUID, db: AsyncSession = Depends(get_db)):
+async def get_task(task_id: UUID, db: AsyncSession = Depends(get_db), _user: User = Depends(require_user)):
     return redact_task(await _get_task(db, task_id))
 
 
 @router.put("/tasks/{task_id}")
-async def update_task(task_id: UUID, body: MonitorTaskUpdate, db: AsyncSession = Depends(get_db)):
+async def update_task(task_id: UUID, body: MonitorTaskUpdate, db: AsyncSession = Depends(get_db), _user: User = Depends(require_operator)):
     task = await _get_task(db, task_id)
     data = body.model_dump(exclude_unset=True)
     for k in ('s3_access_key', 's3_secret_key', 'k8s_kubeconfig'):
@@ -78,7 +94,7 @@ async def update_task(task_id: UUID, body: MonitorTaskUpdate, db: AsyncSession =
 
 
 @router.delete("/tasks/{task_id}")
-async def delete_task(task_id: UUID, db: AsyncSession = Depends(get_db)):
+async def delete_task(task_id: UUID, db: AsyncSession = Depends(get_db), _user: User = Depends(require_operator)):
     task = await _get_task(db, task_id)
     await db.delete(task)
     return {"msg": "deleted"}
@@ -95,6 +111,7 @@ async def monitor_logs(
     log_type: str = "all",
     realtime: bool = False,
     db: AsyncSession = Depends(get_db),
+    _user: User = Depends(require_user),
 ):
     task = await _get_task(db, task_id)
     return list_log_files(
@@ -113,6 +130,7 @@ async def monitor_logs_history(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
+    _user: User = Depends(require_user),
 ):
     task = await _get_task(db, task_id)
     s3_client = get_s3_client(task)
@@ -192,7 +210,7 @@ async def monitor_logs_history(
 
 
 @router.get("/logs/index_detail")
-async def monitor_index_detail(task_id: UUID, key: str, db: AsyncSession = Depends(get_db)):
+async def monitor_index_detail(task_id: UUID, key: str, db: AsyncSession = Depends(get_db), _user: User = Depends(require_user)):
     task = await _get_task(db, task_id)
     s3_client = get_s3_client(task)
     if not s3_client:
@@ -271,12 +289,15 @@ async def monitor_log_view(
     task_id: UUID,
     filename: str,
     keyword: str | None = None,
-    page: int = Query(1),
+    page: int = Query(1, ge=-1, le=100000),
     page_size: int | None = Query(None),
     reverse: bool = Query(True),
     db: AsyncSession = Depends(get_db),
+    _user: User = Depends(require_user),
 ):
     task = await _get_task(db, task_id)
+    if page == 0:
+        page = 1
     ps = page_size or settings.LOG_MONITOR_VIEW_PAGE_SIZE
     ps = min(max(1, ps), settings.LOG_MONITOR_VIEW_MAX_PAGE_SIZE)
 
@@ -328,13 +349,19 @@ async def monitor_log_view(
                     except Exception:
                         pass
                 return {"content": "\n".join(results), "is_search_result": True, "total": len(results)}
-            full_text = ""
+            full_text_parts: list[str] = []
+            remaining = 8 * 1024 * 1024
             for key in target_keys:
+                if remaining <= 0:
+                    break
                 try:
                     obj = s3_client.get_object(Bucket=task.s3_bucket, Key=key)
-                    full_text += obj['Body'].read().decode('utf-8', errors='replace')
+                    chunk = obj['Body'].read(remaining)
+                    full_text_parts.append(chunk.decode('utf-8', errors='replace'))
+                    remaining -= len(chunk)
                 except Exception:
                     pass
+            full_text = "".join(full_text_parts)
             all_lines = full_text.splitlines(True)
             total = len(all_lines)
             if reverse:
@@ -344,8 +371,8 @@ async def monitor_log_view(
             return {"content": "".join(all_lines[start:start + ps]), "total": total, "page": p, "page_size": ps}
 
     log_dir = os.path.join(monitor_engine.LOG_DIR, str(task_id))
-    local_path = os.path.join(log_dir, filename)
-    if not (os.path.sep in filename or '..' in filename) and os.path.exists(local_path):
+    local_path = _safe_local_log_path(log_dir, filename)
+    if local_path:
         return _serve_local_file(local_path, keyword, page, ps, reverse)
 
     s3_client = get_s3_client(task)
@@ -407,17 +434,17 @@ async def monitor_log_view(
 
 
 @router.get("/logs/download")
-async def monitor_log_download(task_id: UUID, filename: str, db: AsyncSession = Depends(get_db)):
+async def monitor_log_download(task_id: UUID, filename: str, db: AsyncSession = Depends(get_db), _user: User = Depends(require_user)):
     task = await _get_task(db, task_id)
     log_dir = os.path.join(monitor_engine.LOG_DIR, str(task_id))
-    local_path = os.path.join(log_dir, filename)
-    if not (os.path.sep in filename or '..' in filename) and os.path.exists(local_path):
-        return FileResponse(local_path, filename=filename, media_type='text/plain')
+    local_path = _safe_local_log_path(log_dir, filename)
+    if local_path:
+        return FileResponse(local_path, filename=_download_name(filename), media_type='text/plain')
 
     s3_client = get_s3_client(task)
     if s3_client and any(filename.startswith(p) for p in task_s3_prefixes(task)):
         obj = s3_client.get_object(Bucket=task.s3_bucket, Key=filename)
-        out_name = os.path.basename(filename) or "log.log"
+        out_name = _download_name(os.path.basename(filename) or "log.log")
         return StreamingResponse(
             iter_s3_lines(obj['Body']),
             media_type='text/plain; charset=utf-8',
@@ -427,7 +454,7 @@ async def monitor_log_download(task_id: UUID, filename: str, db: AsyncSession = 
 
 
 @router.post("/logs/batch_search")
-async def monitor_log_batch_search(body: BatchSearchRequest, db: AsyncSession = Depends(get_db)):
+async def monitor_log_batch_search(body: BatchSearchRequest, db: AsyncSession = Depends(get_db), _user: User = Depends(require_user)):
     task = await _get_task(db, body.task_id)
     s3_client = get_s3_client(task)
     results = []
@@ -436,7 +463,7 @@ async def monitor_log_batch_search(body: BatchSearchRequest, db: AsyncSession = 
     log_dir = os.path.join(monitor_engine.LOG_DIR, str(body.task_id))
     prefixes = task_s3_prefixes(task)
 
-    for fname in body.filenames:
+    for fname in body.filenames[:50]:
         if len(results) >= max_total:
             break
         is_s3 = bool(s3_client and any(str(fname).startswith(p) for p in prefixes))
@@ -452,10 +479,8 @@ async def monitor_log_batch_search(body: BatchSearchRequest, db: AsyncSession = 
             except Exception:
                 pass
         else:
-            if os.path.sep in fname or '..' in fname:
-                continue
-            fpath = os.path.join(log_dir, fname)
-            if not os.path.exists(fpath):
+            fpath = _safe_local_log_path(log_dir, str(fname))
+            if not fpath:
                 continue
             try:
                 with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
@@ -471,5 +496,5 @@ async def monitor_log_batch_search(body: BatchSearchRequest, db: AsyncSession = 
 
 
 @router.get("/status")
-async def monitor_status():
-    return {"running": monitor_engine.is_running(), "log_dir": monitor_engine.LOG_DIR}
+async def monitor_status(_user: User = Depends(require_user)):
+    return {"running": monitor_engine.is_running()}

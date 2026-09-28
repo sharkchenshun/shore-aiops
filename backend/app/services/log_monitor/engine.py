@@ -95,15 +95,6 @@ def _format_slack_error_context(error_lines: list[str] | None, *, max_chars: int
     return f"...(前部省略 {len(text) - max_chars} 字符)\n" + text[-max_chars:]
 
 
-    if not error_lines:
-        return ""
-    text = "\n".join(line.rstrip("\n") for line in error_lines if line and line.strip())
-    text = text.strip()
-    if len(text) <= max_chars:
-        return text
-    return f"...(前部省略 {len(text) - max_chars} 字符)\n" + text[-max_chars:]
-
-
 def _read_file_tail(path: str, max_chars: int = SLACK_ERROR_CONTEXT_MAX) -> str:
     if not path or not os.path.isfile(path):
         return ""
@@ -117,7 +108,7 @@ def _read_file_tail(path: str, max_chars: int = SLACK_ERROR_CONTEXT_MAX) -> str:
             return raw.strip()
         return f"...(前部省略)\n" + raw[-max_chars:].strip()
     except Exception as exc:  # noqa: BLE001
-        logger.debug("read_file_tail.failed", path=path, error=str(exc)[:80])
+        logger.debug("read_file_tail.failed path=%s error=%s", path, str(exc)[:80])
         return ""
 
 
@@ -379,7 +370,7 @@ class MonitorEngine:
 
     def _cleanup_s3(self, task, s3_client, retention_days=90, max_delete=1000):
         try:
-            cutoff = _now() - datetime.timedelta(days=retention_days)
+            cutoff = _now() - datetime.timedelta(days=max(1, int(retention_days or 1)))
             prefix = self._get_s3_prefix(task)
             keys_to_delete = []
             paginator = s3_client.get_paginator('list_objects_v2')
@@ -450,7 +441,8 @@ class MonitorEngine:
                         # Assuming naive or matching tz
                         try:
                             delta = now.timestamp() - task.last_run.timestamp()
-                            if delta >= task.poll_interval_seconds:
+                            interval = max(10, int(task.poll_interval_seconds or 60))
+                            if delta >= interval:
                                 should_run = True
                         except:
                             should_run = True # Fallback
@@ -1207,8 +1199,8 @@ class MonitorEngine:
             pass
         if not task.alert_enabled:
             return
-        webhook_url = task.slack_webhook_url
-        if not webhook_url:
+        webhook_url = (task.slack_webhook_url or "").strip()
+        if not webhook_url.startswith(("http://", "https://")):
             return
         
         now = time.time()
@@ -1230,7 +1222,7 @@ class MonitorEngine:
             f"Check S3 credentials: `s3_access_key` in `monitor_monitortask` table."
         )
         try:
-            req.post(webhook_url, json={"text": text}, timeout=5)
+            req.post(webhook_url, json={"text": text}, timeout=5, follow_redirects=False)
         except Exception:
             pass
 
@@ -1244,8 +1236,8 @@ class MonitorEngine:
         if not task.alert_enabled:
             return
 
-        webhook_url = task.slack_webhook_url or app_settings.SLACK_WEBHOOK_URL
-        if not webhook_url:
+        webhook_url = (task.slack_webhook_url or app_settings.SLACK_WEBHOOK_URL or "").strip()
+        if not webhook_url.startswith(("http://", "https://")):
             return
             
         # --- Deduplication (Alert Silence) ---
@@ -1339,7 +1331,7 @@ class MonitorEngine:
 
         try:
             payload = {"blocks": blocks}
-            resp = httpx.post(webhook_url, json=payload, timeout=10)
+            resp = httpx.post(webhook_url, json=payload, timeout=10, follow_redirects=False)
             if resp.status_code >= 400:
                 logger.error(
                     "Slack webhook failed for task %s: HTTP %s %s",
@@ -1386,7 +1378,7 @@ class MonitorEngine:
         current_date = now.date()
         current_h_start = (now.hour // 4) * 4
         
-        retention_date = current_date - datetime.timedelta(days=task.retention_days)
+        retention_date = current_date - datetime.timedelta(days=max(1, int(task.retention_days or 3)))
 
         for fp in files:
             fname = os.path.basename(fp)

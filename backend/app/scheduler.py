@@ -108,6 +108,24 @@ async def _architecture_analysis():
             logger.warning("scheduler.architecture.failed", error=str(e))
 
 
+async def _daily_inspection():
+    """每日 Prometheus 集群巡检（合并自 shark-Platform inspection）。"""
+    if not settings.INSPECTION_ENABLED:
+        return
+    import asyncio
+    from app.services.environments import list_profiles
+    from app.services.inspection.engine import inspection_engine
+
+    for profile in list_profiles():
+        if not profile.enabled:
+            continue
+        try:
+            await asyncio.to_thread(inspection_engine.run, profile.id)
+            logger.info("scheduler.inspection.done", env=profile.id)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("scheduler.inspection.failed", env=profile.id, error=str(e)[:160])
+
+
 def start_scheduler():
     global _scheduler
     try:
@@ -147,11 +165,22 @@ def start_scheduler():
             id="architecture_analysis",
             replace_existing=True,
         )
+        if settings.INSPECTION_ENABLED:
+            _scheduler.add_job(
+                _daily_inspection,
+                CronTrigger.from_crontab(settings.INSPECTION_CRON, timezone="Asia/Shanghai"),
+                id="daily_inspection",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=6 * 60 * 60,
+            )
         _scheduler.start()
         logger.info("scheduler.started", discovery_interval=settings.DISCOVERY_INTERVAL,
                     scan_cron=settings.AUTO_SCAN_CRON,
                     gitlab_ci=bool(settings.GITLAB_CI_SCAN_ENABLED and settings.GITLAB_TOKEN),
-                    monitor_patrol=settings.MONITOR_PATROL_ENABLED)
+                    monitor_patrol=settings.MONITOR_PATROL_ENABLED,
+                    inspection=settings.INSPECTION_ENABLED)
     except Exception as e:  # noqa: BLE001
         logger.warning("scheduler.start.failed", error=str(e))
 
