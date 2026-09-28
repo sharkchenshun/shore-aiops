@@ -32,8 +32,9 @@ RUN set -eux; \
       esac; \
       wget -q "https://github.com/projectdiscovery/${tool}/releases/download/v${ver}/${tool}_${ver}_linux_${PDARCH}.zip" -O /tmp/${tool}.zip || true; \
       if [ -f /tmp/${tool}.zip ]; then unzip -o /tmp/${tool}.zip -d /usr/local/bin/ ${tool} 2>/dev/null || true; rm -f /tmp/${tool}.zip; fi; \
-    done; \
-    nuclei -update-templates 2>/dev/null || true
+    done
+# nuclei 模板库很大，构建期 `nuclei -update-templates` 经常要数分钟，且默认写到 /root，
+# 镜像以 appuser 运行时用不上。首次扫描前在容器内自行更新即可。
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

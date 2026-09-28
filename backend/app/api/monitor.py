@@ -26,11 +26,10 @@ from app.schemas.monitor import BatchSearchRequest, MonitorTaskCreate, MonitorTa
 from app.services.log_monitor.s3_helpers import (
     get_s3_client,
     handle_s3_error,
-    index_s3_key,
     iter_s3_lines,
-    latest_completed_4h_window_start,
     list_log_files,
     redact_task,
+    resolve_s3_recent_keys,
     task_s3_prefixes,
 )
 from app.services.log_monitor.engine import _make_aware, _now, monitor_engine
@@ -39,13 +38,23 @@ router = APIRouter(prefix="/monitor", tags=["monitor"])
 
 
 def _safe_local_log_path(log_dir: str, filename: str) -> str | None:
-    if not filename or os.path.sep in filename or ".." in filename:
+    if not filename or filename in {".", ".."}:
+        return None
+    if os.path.sep in filename or "/" in filename or "\\" in filename:
         return None
     base = os.path.realpath(log_dir)
     path = os.path.realpath(os.path.join(base, filename))
     if path != base and not path.startswith(base + os.sep):
         return None
     return path if os.path.isfile(path) else None
+
+
+def _keyword_terms(keyword: str | None) -> list[str] | None:
+    """空白关键字不能当成「匹配每一行」。None 表示不做内容搜索。"""
+    if not keyword:
+        return None
+    terms = [k for k in keyword.lower().split() if k]
+    return terms or None
 
 
 def _download_name(name: str) -> str:
@@ -83,7 +92,7 @@ async def get_task(task_id: UUID, db: AsyncSession = Depends(get_db), _user: Use
 async def update_task(task_id: UUID, body: MonitorTaskUpdate, db: AsyncSession = Depends(get_db), _user: User = Depends(require_operator)):
     task = await _get_task(db, task_id)
     data = body.model_dump(exclude_unset=True)
-    for k in ('s3_access_key', 's3_secret_key', 'k8s_kubeconfig'):
+    for k in ('s3_access_key', 's3_secret_key', 'k8s_kubeconfig', 'slack_webhook_url'):
         if k in data and not data[k]:
             data.pop(k, None)
     for k, v in data.items():
@@ -160,6 +169,8 @@ async def monitor_logs_history(
         paginator = client.get_paginator('list_objects_v2')
         for p in paginator.paginate(Bucket=task.s3_bucket, Prefix=prefix):
             for obj in p.get('Contents', []) or []:
+                if len(fetched) >= 3000:
+                    return fetched
                 key = obj.get('Key') or ''
                 if not key.endswith('.json'):
                     continue
@@ -192,8 +203,6 @@ async def monitor_logs_history(
     try:
         items = fetch_items(s3_client)
     except Exception as e:
-        async def _save(t):
-            pass
         if handle_s3_error(e, task, lambda t: None):
             s3_client = get_s3_client(task)
             try:
@@ -236,9 +245,9 @@ def _serve_local_file(fpath: str, keyword: str | None, page: int, page_size: int
     max_page = settings.LOG_MONITOR_VIEW_MAX_PAGE_SIZE
     page_size = min(max(1, page_size), max_page)
 
-    if keyword:
+    keywords = _keyword_terms(keyword)
+    if keywords:
         results = []
-        keywords = keyword.lower().split()
         max_kw = 2000
         with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
             for line in f:
@@ -303,40 +312,11 @@ async def monitor_log_view(
 
     if filename.endswith('_s3_recent.log'):
         s3_client = get_s3_client(task)
-        if s3_client:
-            lt = 'raw'
-            ws = latest_completed_4h_window_start(_now())
-            payload = None
-            try:
-                payload = monitor_engine.get_realtime_index_payload(task, lt)
-            except Exception:
-                pass
-            if not payload:
-                idx_key = index_s3_key(task, lt, ws)
-                try:
-                    obj = s3_client.get_object(Bucket=task.s3_bucket, Key=idx_key)
-                    payload = json.loads(obj['Body'].read().decode('utf-8', errors='replace'))
-                except Exception:
-                    pass
-            target_keys = []
-            if payload and isinstance(payload.get('files'), list):
-                for f in payload['files']:
-                    key = f.get('name') or ''
-                    if '/raw/' in key:
-                        try:
-                            idx = key.find('/raw/')
-                            rest = key[idx + 5:]
-                            p = rest.split('/')
-                            if len(p) >= 4:
-                                virtual_name = f"{p[0]}_{p[1]}_s3_recent.log"
-                                if virtual_name == filename:
-                                    target_keys.append(key)
-                        except Exception:
-                            pass
-            target_keys.sort()
-            if keyword:
+        target_keys = resolve_s3_recent_keys(task, filename) if s3_client else []
+        if s3_client and target_keys:
+            keywords = _keyword_terms(keyword)
+            if keywords:
                 results = []
-                keywords = keyword.lower().split()
                 for key in target_keys:
                     try:
                         obj = s3_client.get_object(Bucket=task.s3_bucket, Key=key)
@@ -368,7 +348,10 @@ async def monitor_log_view(
                 all_lines.reverse()
             p = page if page != -1 else max(1, math.ceil(total / ps))
             start = (p - 1) * ps
-            return {"content": "".join(all_lines[start:start + ps]), "total": total, "page": p, "page_size": ps}
+            out = {"content": "".join(all_lines[start:start + ps]), "total": total, "page": p, "page_size": ps}
+            if remaining <= 0:
+                out["warning"] = "S3 实时日志仅加载约 8MB，完整内容请下载或查历史。"
+            return out
 
     log_dir = os.path.join(monitor_engine.LOG_DIR, str(task_id))
     local_path = _safe_local_log_path(log_dir, filename)
@@ -387,9 +370,9 @@ async def monitor_log_view(
                 size = int(head.get('ContentLength') or 0)
             else:
                 raise HTTPException(404, "File not found") from e
-        if keyword:
+        keywords = _keyword_terms(keyword)
+        if keywords:
             results = []
-            keywords = keyword.lower().split()
             obj = s3_client.get_object(Bucket=task.s3_bucket, Key=filename)
             for line in iter_s3_lines(obj['Body']):
                 ll = line.lower()
@@ -442,6 +425,19 @@ async def monitor_log_download(task_id: UUID, filename: str, db: AsyncSession = 
         return FileResponse(local_path, filename=_download_name(filename), media_type='text/plain')
 
     s3_client = get_s3_client(task)
+    if filename.endswith('_s3_recent.log') and s3_client:
+        keys = resolve_s3_recent_keys(task, filename)
+        if keys:
+            def _gen():
+                for key in keys:
+                    obj = s3_client.get_object(Bucket=task.s3_bucket, Key=key)
+                    yield from iter_s3_lines(obj['Body'])
+            out_name = _download_name(filename)
+            return StreamingResponse(
+                _gen(),
+                media_type='text/plain; charset=utf-8',
+                headers={'Content-Disposition': f'attachment; filename="{out_name}"'},
+            )
     if s3_client and any(filename.startswith(p) for p in task_s3_prefixes(task)):
         obj = s3_client.get_object(Bucket=task.s3_bucket, Key=filename)
         out_name = _download_name(os.path.basename(filename) or "log.log")
@@ -459,7 +455,9 @@ async def monitor_log_batch_search(body: BatchSearchRequest, db: AsyncSession = 
     s3_client = get_s3_client(task)
     results = []
     max_total = 2000
-    keywords = body.keyword.lower().split()
+    keywords = _keyword_terms(body.keyword) or []
+    if not keywords:
+        return {"results": []}
     log_dir = os.path.join(monitor_engine.LOG_DIR, str(body.task_id))
     prefixes = task_s3_prefixes(task)
 

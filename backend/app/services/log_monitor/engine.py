@@ -343,8 +343,8 @@ class MonitorEngine:
                     ws_iso = last_ws_iso
                     try:
                         ws = datetime.datetime.fromisoformat(ws_iso)
-                        if dt.tzinfo is None:
-                            dt = _make_aware(dt)
+                        if ws.tzinfo is None:
+                            ws = _make_aware(ws)
                         we = _localtime(ws) + datetime.timedelta(hours=4) - datetime.timedelta(seconds=1)
                     except Exception:
                         ws = self._get_4h_window_start(now)
@@ -455,7 +455,7 @@ class MonitorEngine:
                             task_store.save_task(task, ['last_run', 'last_error', 'alerts_sent_count'])
                         except Exception as e:
                             logger.error(f"Error processing task {task.name}: {e}")
-                            task.last_error = str(e)
+                            task.last_error = str(e)[:500]
                             task_store.save_task(task, ['last_error'])
 
                     try:
@@ -540,10 +540,10 @@ class MonitorEngine:
             return raw or ""
         except Exception as exc:
             logger.debug(
-                "fetch_pod_log_tail.failed",
-                pod=pod_name,
-                namespace=namespace,
-                error=str(exc)[:120],
+                "fetch_pod_log_tail.failed pod=%s ns=%s error=%s",
+                pod_name,
+                namespace,
+                str(exc)[:120],
             )
             return ""
 
@@ -555,7 +555,7 @@ class MonitorEngine:
         if not namespaces:
             namespaces = ['default']
         
-        today_str = datetime.date.today().isoformat()
+        today_str = _localtime(_now()).date().isoformat()
         
         # User requirement: "Don't store locally, only error logs store locally."
         # This implies Raw Logs should go to S3 if enabled, or be discarded/kept in memory?
@@ -852,7 +852,7 @@ class MonitorEngine:
             return False
         
         # Separate file for errors: pod_name_YYYY-MM-DD_error.log
-        today_str = datetime.date.today().isoformat()
+        today_str = _localtime(_now()).date().isoformat()
         error_file_path = os.path.join(log_dir, f"{source_name}_{today_str}_error.log")
         
         error_file_handle = None
@@ -1175,7 +1175,7 @@ class MonitorEngine:
             logger.error(f"Failed to write scan history: {e}")
 
         if error_lines:
-            today_str = datetime.date.today().isoformat()
+            today_str = _localtime(_now()).date().isoformat()
             task_err_path = os.path.join(log_dir, f"task_errors_{today_str}.log")
             try:
                 with open(task_err_path, "a", encoding="utf-8") as f:
