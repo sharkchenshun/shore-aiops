@@ -1,0 +1,891 @@
+# ============================================================
+# app/services/inspection/engine.py — Prometheus 集群巡检引擎
+# 合并自 shark-Platform inspection/engine.py，Django ORM 改为同步 SQLAlchemy。
+# ============================================================
+
+import json
+import logging
+import threading
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+
+import httpx
+
+from app.core.config import settings as app_settings
+from app.services.environments import get_active_profile
+from app.services.inspection import store as insp_store
+from app.services.inspection.cluster_checks import (
+    attach_server_deltas,
+    collect_cluster_checks,
+    compute_health_score,
+    label_servers,
+    mark_server_pressure,
+    sort_servers,
+    RESOURCE_DELTA_WARN_PT,
+    _hostname_from_metric,
+)
+from app.services.inspection.urlsafety import (
+    hosts_match,
+    redact_secrets,
+    safe_model_id,
+    sanitize_http_url,
+)
+
+logger = logging.getLogger("inspection")
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def log(_task_id, msg):
+    logger.info(msg)
+
+
+def _today_id() -> str:
+    return datetime.now(_SHANGHAI).strftime("%Y-%m-%d")
+
+
+def _date_id(days_ago: int = 0) -> str:
+    return (datetime.now(_SHANGHAI).date() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+
+
+def _trusted_prometheus_urls(env_id=None) -> list[str]:
+    profile = get_active_profile(env_id)
+    return [
+        profile.prometheus_url,
+        app_settings.PROMETHEUS_URL,
+    ]
+
+
+def _http_get(url, params=None, timeout=10, env_id=None):
+    profile = get_active_profile(env_id)
+    user = (profile.prometheus_username or app_settings.PROMETHEUS_USERNAME or "").strip()
+    password = app_settings.PROMETHEUS_PASSWORD or ""
+    auth = None
+    if user and password and any(hosts_match(url, trusted) for trusted in _trusted_prometheus_urls(env_id)):
+        auth = (user, password)
+    verify = profile.prometheus_ssl_verify if profile.prometheus_url else app_settings.PROMETHEUS_SSL_VERIFY
+    with httpx.Client(timeout=timeout, verify=verify, auth=auth, follow_redirects=False) as client:
+        resp = client.get(url, params=params)
+        resp.read()
+        return resp
+
+
+def _http_post(url, *, json=None, headers=None, timeout=60):
+    with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+        resp = client.post(url, json=json, headers=headers)
+        resp.read()
+        return resp
+
+
+class InspectionEngine:
+    def __init__(self):
+        self._config = None
+        self._run_lock = threading.Lock()
+        self._env_id = None
+
+    @property
+    def config(self):
+        if self._config is None:
+            try:
+                self._config = insp_store.load_config(self._env_id)
+            except Exception as e:
+                print(f"Warning: Failed to load InspectionConfig: {e}")
+                # Return a dummy config or handle gracefully during migration
+                self._config = insp_store.empty_config(self._env_id)
+        return self._config
+
+    @config.setter
+    def config(self, value):
+        self._config = value
+
+    def _get_base_url(self):
+        try:
+            url = sanitize_http_url(self.config.prometheus_url)
+        except ValueError:
+            url = ""
+        if not url:
+            profile = get_active_profile(self._env_id)
+            try:
+                url = sanitize_http_url(profile.prometheus_url or app_settings.PROMETHEUS_URL)
+            except ValueError:
+                url = ""
+        return url
+
+    def _ai_target(self) -> tuple[str, str, str]:
+        """返回 (base_url, api_key, model)。外部自定义网关不回退平台密钥。"""
+        try:
+            custom_base = sanitize_http_url(self.config.ark_base_url)
+        except ValueError:
+            custom_base = ""
+        custom_key = (self.config.ark_api_key or "").strip()
+        custom_model = (self.config.ark_model_id or "").strip()
+        try:
+            platform_base = sanitize_http_url(app_settings.llm_base_url)
+        except ValueError:
+            platform_base = ""
+        if custom_base and not hosts_match(custom_base, platform_base):
+            return custom_base, custom_key, custom_model
+        return (
+            platform_base or custom_base,
+            custom_key or app_settings.llm_api_key,
+            custom_model or app_settings.llm_model,
+        )
+
+    def _ai_key(self):
+        return self._ai_target()[1]
+
+    def _ai_base(self):
+        return self._ai_target()[0]
+
+    def _ai_model(self):
+        _base, _key, model = self._ai_target()
+        return safe_model_id(model, fallback=app_settings.llm_model)
+
+    def _prom_ready(self) -> bool:
+        return bool(self._get_base_url())
+
+    def _query_prometheus(self, query):
+        if not self._prom_ready():
+            return []
+        try:
+            url = f"{self._get_base_url()}/api/v1/query"
+            log("inspection", f"Querying Prometheus: {query}")
+            resp = _http_get(url, params={'query': query}, timeout=10, env_id=self._env_id)
+            if resp.is_success:
+                return resp.json().get('data', {}).get('result', [])
+        except Exception as e:
+            print(f"Prometheus query error: {e}")
+            log("inspection", f"Prometheus query error: {e}")
+        return []
+
+    def _list_metric_names(self):
+        """扫 Prometheus 里实际有的指标名。失败返回 None，清单退回按食谱探测。"""
+        if not self._prom_ready():
+            return None
+        try:
+            url = f"{self._get_base_url()}/api/v1/label/__name__/values"
+            log("inspection", "Listing Prometheus metric names")
+            resp = _http_get(url, timeout=15, env_id=self._env_id)
+            if resp.is_success:
+                payload = resp.json()
+                if payload.get("status") == "success":
+                    return [str(n) for n in (payload.get("data") or []) if n]
+            log("inspection", f"List metric names HTTP {getattr(resp, 'status_code', '?')}")
+        except Exception as e:
+            print(f"Prometheus metric names error: {e}")
+            log("inspection", f"Prometheus metric names error: {e}")
+        return None
+
+    def _get_targets(self):
+        if not self._prom_ready():
+            return []
+        try:
+            url = f"{self._get_base_url()}/api/v1/targets"
+            resp = _http_get(url, timeout=5, env_id=self._env_id)
+            if resp.is_success:
+                return resp.json().get('data', {}).get('activeTargets', [])
+        except:
+            pass
+        return []
+
+    def _get_alerts(self):
+        if not self._prom_ready():
+            return []
+        try:
+            url = f"{self._get_base_url()}/api/v1/alerts"
+            resp = _http_get(url, timeout=5, env_id=self._env_id)
+            if resp.is_success:
+                return resp.json().get('data', {}).get('alerts', [])
+        except:
+            pass
+        return []
+
+    def _call_gemini_api(self, prompt, system_prompt):
+        """Call Google Gemini API (REST)"""
+        api_key = self._ai_key()
+        model = safe_model_id(self._ai_model(), fallback="gemini-1.5-flash") or "gemini-1.5-flash"
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+        payload = {
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }],
+            "systemInstruction": {
+                "parts": [{"text": system_prompt}]
+            }
+        }
+
+        try:
+            resp = _http_post(
+                url,
+                json=payload,
+                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+                timeout=60,
+            )
+            if resp.is_success:
+                data = resp.json()
+                try:
+                    return data['candidates'][0]['content']['parts'][0]['text']
+                except (KeyError, IndexError):
+                    return "Gemini response parsing failed"
+            return f"Gemini API failed: {resp.status_code}"
+        except Exception:
+            return "Gemini connection error"
+
+    def _call_openai_compatible_api(self, prompt, system_prompt):
+        """Call OpenAI/Ark/Doubao compatible API"""
+        base = self._ai_base()
+        if not base:
+            return "AI configuration error: Missing Base URL."
+        url = f"{base}/chat/completions"
+
+        payload = {
+            "model": self._ai_model(),
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ]
+        }
+
+        try:
+            resp = _http_post(
+                url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {self._ai_key()}",
+                    "Content-Type": "application/json"
+                },
+                timeout=300,
+            )
+            if resp.is_success:
+                return resp.json()['choices'][0]['message']['content']
+            return f"AI analysis failed: {resp.status_code}"
+        except Exception as e:
+            return f"AI analysis error: {redact_secrets(str(e))}"
+
+    def _calculate_health_score(self, down_targets, firing_alerts, servers, pvc_items=None, data_insufficient=False, elasticsearch=None, cluster=None):
+        return compute_health_score(
+            down_targets,
+            firing_alerts,
+            servers,
+            pvc_items=pvc_items,
+            data_insufficient=data_insufficient,
+            elasticsearch=elasticsearch,
+            cluster=cluster,
+        )
+
+    def _predict_future_scores(self, current_score):
+        """
+        Simple prediction based on last 7 days history.
+        Uses simple linear trend or moving average.
+        """
+        if current_score is None:
+            return {
+                "7d": {"risk_score": None},
+                "15d": {"risk_score": None},
+                "30d": {"risk_score": None},
+            }
+        # Get last 7 reports
+        history_scores = []
+        
+        try:
+            # We want reports before today
+            for i in range(1, 8):
+                d = _date_id(i)
+                report = insp_store.get_report(d, self._env_id)
+                if report and report.content:
+                    s = report.content.get('health_summary', {}).get('score') or report.content.get('risk_summary', {}).get('score')
+                    if s is not None:
+                        history_scores.append(float(s))
+        except Exception:
+            pass
+            
+        # Add current score as the latest data point
+        history_scores.insert(0, current_score)
+        
+        # Simple Logic: 
+        # If we have enough history, calculate trend.
+        # Otherwise assume stable.
+        
+        predictions = {}
+        
+        if len(history_scores) < 3:
+            # Not enough data, assume stable with slight random variance or just current
+            predictions = {
+                "7d": {"risk_score": current_score},
+                "15d": {"risk_score": current_score},
+                "30d": {"risk_score": current_score}
+            }
+        else:
+            # Calculate simple trend (average daily change)
+            # scores are [today, yesterday, day_before...]
+            # daily_change = (today - oldest) / days
+            oldest = history_scores[-1]
+            days = len(history_scores) - 1
+            daily_change = (current_score - oldest) / days if days > 0 else 0
+            
+            # Predict
+            pred_7 = max(0, min(100, current_score + (daily_change * 7)))
+            pred_15 = max(0, min(100, current_score + (daily_change * 15)))
+            pred_30 = max(0, min(100, current_score + (daily_change * 30)))
+            
+            predictions = {
+                "7d": {"risk_score": round(pred_7, 1)},
+                "15d": {"risk_score": round(pred_15, 1)},
+                "30d": {"risk_score": round(pred_30, 1)}
+            }
+            
+        return predictions
+
+    def _overlapping_run_result(self, env_id=None):
+        log("inspection", "Skip overlapping inspection run")
+        report_id = _today_id()
+        existing = insp_store.get_report(report_id, env_id)
+        if existing and existing.content:
+            payload = dict(existing.content)
+            payload["busy"] = True
+            return payload
+        return {
+            "report_id": report_id,
+            "verdict": "巡检正在执行，请稍后刷新",
+            "findings": ["上一轮巡检尚未结束"],
+            "checklist": [],
+            "score": None,
+            "level": "unknown",
+            "health_summary": {"score": None, "level": "unknown", "reasons": ["巡检进行中"]},
+            "data_insufficient": True,
+            "busy": True,
+        }
+
+    def run(self, env_id=None):
+        env_id = env_id or get_active_profile().id
+        if not self._run_lock.acquire(blocking=False):
+            return self._overlapping_run_result(env_id)
+        try:
+            self._env_id = env_id
+            return self._execute()
+        finally:
+            self._run_lock.release()
+
+    def _execute(self):
+        log("inspection", "Starting inspection run...")
+        try:
+            self._config = insp_store.load_config(self._env_id)
+        except Exception as e:
+            log("inspection", f"Reload InspectionConfig failed: {e}")
+            self._config = insp_store.empty_config(self._env_id)
+        report_id = _today_id()
+        if not self._get_base_url():
+            log("inspection", "Skip inspection: prometheus_url empty")
+            existing = insp_store.get_report(report_id, self._env_id)
+            if existing and existing.content:
+                return existing.content
+            return {
+                "report_id": report_id,
+                "verdict": "无法判定（未配置 Prometheus Endpoint）",
+                "findings": ["未配置 Prometheus Endpoint，巡检未执行"],
+                "checklist": [],
+                "score": None,
+                "level": "unknown",
+                "health_summary": {"score": None, "level": "unknown", "reasons": ["未配置 Prometheus"]},
+                "data_insufficient": True,
+            }
+
+        # 1. Collect Data
+        metrics_summary = []
+        
+        # Targets
+        log("inspection", "Fetching targets...")
+        targets = self._get_targets()
+        total_targets = len(targets)
+        raw_down = [t for t in targets if t.get('health') != 'up']
+        
+        # Transform for frontend display
+        down_targets = []
+        for t in raw_down:
+            labels = t.get('labels', {})
+            down_targets.append({
+                "job": labels.get('job', 'unknown'),
+                "instance": labels.get('instance', 'unknown'),
+                "last_error": t.get('lastError', ''),
+                "last_scrape": t.get('lastScrape', ''),
+            })
+            
+        log("inspection", f"Targets fetched: {total_targets} total, {len(down_targets)} down")
+        
+        metrics_summary.append({
+            "category": "prometheus", "name": "targets_total", "display": "Targets Total",
+            "labels": {}, "value": total_targets, "unit": "count", "level": "ok", "status": "success"
+        })
+        metrics_summary.append({
+            "category": "prometheus", "name": "down_targets", "display": "Down Targets",
+            "labels": {}, "value": len(down_targets), "unit": "count", "level": "ok" if not down_targets else "critical", "status": "success"
+        })
+
+        # Alerts
+        log("inspection", "Fetching alerts...")
+        alerts = self._get_alerts()
+        raw_firing = [a for a in alerts if a.get('state') == 'firing']
+        
+        # Transform for frontend display
+        firing = []
+        for a in raw_firing:
+            labels = a.get('labels', {})
+            annotations = a.get('annotations', {})
+            firing.append({
+                "name": labels.get('alertname', 'Unknown Alert'),
+                "severity": labels.get('severity', 'warning'),
+                "summary": annotations.get('summary', 'No summary available'),
+                "instance": labels.get('instance') or "",
+                "job": labels.get('job') or "",
+            })
+            
+        log("inspection", f"Alerts fetched: {len(alerts)} total, {len(firing)} firing")
+        metrics_summary.append({
+            "category": "prometheus", "name": "alerts_total", "display": "Alerts Total",
+            "labels": {}, "value": len(alerts), "unit": "count", "level": "ok", "status": "success"
+        })
+        metrics_summary.append({
+            "category": "prometheus", "name": "firing_alerts", "display": "Firing Alerts",
+            "labels": {}, "value": len(firing), "unit": "count", "level": "ok" if not firing else "warning", "status": "success"
+        })
+
+        log("inspection", "Querying node resource usage...")
+        cpu_query = '(100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100))'
+        mem_query = '((1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100)'
+        disk_query = '((1 - (node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"})) * 100)'
+        load1_query = 'node_load1'
+        uptime_h_query = '((time() - node_boot_time_seconds) / 3600)'
+
+        cpu_results = self._query_prometheus(cpu_query)
+        mem_results = self._query_prometheus(mem_query)
+        disk_results = self._query_prometheus(disk_query)
+        load1_results = self._query_prometheus(load1_query)
+        uptime_results = self._query_prometheus(uptime_h_query)
+
+        by_instance = {}
+        def _set(inst, k, v, metric=None):
+            if not inst:
+                return
+            if inst not in by_instance:
+                by_instance[inst] = {"instance": inst}
+            by_instance[inst][k] = v
+            name = _hostname_from_metric(metric)
+            if name and not by_instance[inst].get("nodename"):
+                by_instance[inst]["nodename"] = name
+
+        for r in cpu_results:
+            inst = (r.get('metric') or {}).get('instance') or ''
+            try:
+                _set(inst, 'cpu_pct', round(float(r['value'][1]), 2), r.get('metric'))
+            except Exception:
+                pass
+        for r in mem_results:
+            inst = (r.get('metric') or {}).get('instance') or ''
+            try:
+                _set(inst, 'mem_pct', round(float(r['value'][1]), 2), r.get('metric'))
+            except Exception:
+                pass
+        for r in disk_results:
+            inst = (r.get('metric') or {}).get('instance') or ''
+            try:
+                _set(inst, 'disk_pct', round(float(r['value'][1]), 2), r.get('metric'))
+            except Exception:
+                pass
+        for r in load1_results:
+            inst = (r.get('metric') or {}).get('instance') or ''
+            try:
+                _set(inst, 'load1', round(float(r['value'][1]), 2), r.get('metric'))
+            except Exception:
+                pass
+        for r in uptime_results:
+            inst = (r.get('metric') or {}).get('instance') or ''
+            try:
+                _set(inst, 'uptime_hours', round(float(r['value'][1]), 1), r.get('metric'))
+            except Exception:
+                pass
+
+        mem_total_results = self._query_prometheus('node_memory_MemTotal_bytes')
+        mem_avail_results = self._query_prometheus('node_memory_MemAvailable_bytes')
+        disk_size_results = self._query_prometheus(
+            'node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}'
+        )
+        disk_avail_results = self._query_prometheus(
+            'node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}'
+        )
+        cpu_cores_results = self._query_prometheus('count by (instance) (node_cpu_seconds_total{mode="idle"})')
+        mem_total = {}
+        mem_avail = {}
+        for r in mem_total_results:
+            inst = (r.get('metric') or {}).get('instance') or ''
+            try:
+                mem_total[inst] = float(r['value'][1])
+            except Exception:
+                pass
+        for r in mem_avail_results:
+            inst = (r.get('metric') or {}).get('instance') or ''
+            try:
+                mem_avail[inst] = float(r['value'][1])
+            except Exception:
+                pass
+        for inst, total in mem_total.items():
+            avail = mem_avail.get(inst)
+            if avail is None:
+                continue
+            _set(inst, 'mem_total_bytes', int(total))
+            _set(inst, 'mem_used_bytes', int(max(0, total - avail)))
+        for r in disk_size_results:
+            inst = (r.get('metric') or {}).get('instance') or ''
+            try:
+                _set(inst, 'disk_total_bytes', int(float(r['value'][1])))
+            except Exception:
+                pass
+        for r in disk_avail_results:
+            inst = (r.get('metric') or {}).get('instance') or ''
+            size = (by_instance.get(inst) or {}).get('disk_total_bytes')
+            try:
+                avail = float(r['value'][1])
+            except Exception:
+                continue
+            if size:
+                _set(inst, 'disk_used_bytes', int(max(0, float(size) - avail)))
+        for r in cpu_cores_results:
+            inst = (r.get('metric') or {}).get('instance') or ''
+            try:
+                _set(inst, 'cpu_cores', int(float(r['value'][1])))
+            except Exception:
+                pass
+
+        servers = list(by_instance.values())
+        mem_24h_query = (
+            '((1 - (node_memory_MemAvailable_bytes offset 24h / node_memory_MemTotal_bytes offset 24h)) * 100)'
+        )
+        disk_24h_query = (
+            '((1 - (node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"} offset 24h'
+            ' / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"} offset 24h)) * 100)'
+        )
+        servers = attach_server_deltas(
+            servers,
+            self._query_prometheus(mem_24h_query),
+            self._query_prometheus(disk_24h_query),
+        )
+        servers = label_servers(self._query_prometheus, servers, targets=targets)
+        servers = mark_server_pressure(servers)
+        sort_servers(servers)
+
+        def _avg(key):
+            vals = [float(s.get(key) or 0) for s in servers if s.get(key) is not None]
+            return round(sum(vals) / len(vals), 2) if vals else 0.0
+
+        hot = [s for s in servers if s.get("level") in ("warning", "critical")]
+        rising = [
+            s for s in servers
+            if (s.get("disk_delta_24h") or 0) >= RESOURCE_DELTA_WARN_PT
+            or (s.get("mem_delta_24h") or 0) >= RESOURCE_DELTA_WARN_PT
+        ]
+        fleet_summary = {
+            "server_count": len(servers),
+            "avg_cpu_pct": _avg('cpu_pct'),
+            "avg_mem_pct": _avg('mem_pct'),
+            "avg_disk_pct": _avg('disk_pct'),
+            "hot_count": len(hot),
+            "rising_24h_count": len(rising),
+            "top_cpu": sorted(servers, key=lambda x: float(x.get('cpu_pct') or 0), reverse=True)[:10],
+            "top_mem": sorted(servers, key=lambda x: float(x.get('mem_pct') or 0), reverse=True)[:10],
+            "top_disk": sorted(servers, key=lambda x: float(x.get('disk_pct') or 0), reverse=True)[:10],
+        }
+
+        metrics_summary.append({
+            "category": "fleet", "name": "server_count", "display": "Servers",
+            "labels": {}, "value": len(servers), "unit": "count", "level": "ok", "status": "success"
+        })
+        metrics_summary.append({
+            "category": "fleet", "name": "avg_cpu_pct", "display": "Avg CPU",
+            "labels": {}, "value": fleet_summary["avg_cpu_pct"], "unit": "%", "level": "ok", "status": "success", "query": cpu_query
+        })
+        metrics_summary.append({
+            "category": "fleet", "name": "avg_mem_pct", "display": "Avg Memory",
+            "labels": {}, "value": fleet_summary["avg_mem_pct"], "unit": "%", "level": "ok", "status": "success", "query": mem_query
+        })
+        metrics_summary.append({
+            "category": "fleet", "name": "avg_disk_pct", "display": "Avg Disk(/)",
+            "labels": {}, "value": fleet_summary["avg_disk_pct"], "unit": "%", "level": "ok", "status": "success", "query": disk_query
+        })
+
+        log("inspection", "Collecting cluster checklist (PVC / kube-state / blackbox)...")
+        prev_keys = []
+        prev_times = {}
+        try:
+            today_id = _today_id()
+            yid = _date_id(1)
+            for rid in (today_id, yid):
+                prev = insp_store.get_report(rid, self._env_id)
+                if not prev or not prev.content:
+                    continue
+                ts = prev.content.get("timestamp") or ""
+                for x in (prev.content.get("decommissioned") or []):
+                    k = f"{x.get('job') or ''}|{x.get('instance') or ''}"
+                    prev_keys.append(k)
+                    if x.get("last_scrape") or x.get("when") or ts:
+                        prev_times[k] = x.get("last_scrape") or ts
+                for t in (prev.content.get("down_targets") or []):
+                    k = f"{t.get('job') or ''}|{t.get('instance') or ''}"
+                    prev_keys.append(k)
+                    if t.get("last_scrape") or ts:
+                        prev_times[k] = t.get("last_scrape") or ts
+                if prev_keys:
+                    break
+        except Exception:
+            prev_keys = []
+            prev_times = {}
+        ignore_keys = []
+        try:
+            ignore_keys = insp_store.list_ignore_keys(self._env_id)
+        except Exception:
+            ignore_keys = []
+        try:
+            cluster = collect_cluster_checks(
+                self._query_prometheus,
+                firing_alerts=firing,
+                down_targets=down_targets,
+                servers=servers,
+                metric_names=self._list_metric_names(),
+                previous_leftover_keys=prev_keys,
+                ignore_keys=ignore_keys,
+                previous_times=prev_times,
+            )
+        except Exception as e:
+            log("inspection", f"Cluster checklist failed: {e}")
+            cluster = {
+                "verdict": "无法判定（清单采集失败）",
+                "findings": [str(e)],
+                "checks": [],
+                "pvc": {"available": False, "items": [], "top": [], "source": ""},
+                "services": [],
+                "elasticsearch": {},
+                "middleware": {},
+                "workloads": {},
+                "discovery": {"scanned": False, "metric_name_count": 0, "middleware_families": 0},
+                "known_normals": [],
+                "decommissioned": [],
+                "data_insufficient": True,
+            }
+        firing = cluster.get("firing_alerts", firing)
+        down_targets = cluster.get("down_targets", down_targets)
+        pvc_items = (cluster.get("pvc") or {}).get("items") or []
+        metrics_summary.append({
+            "category": "storage", "name": "pvc_count", "display": "PVC 用量样本",
+            "labels": {}, "value": len(pvc_items), "unit": "count",
+            "level": "ok" if cluster.get("pvc", {}).get("available") else "warning",
+            "status": "success",
+        })
+
+        # 2. AI Analysis
+        log("inspection", "Starting AI analysis...")
+        ai_analysis = "AI analysis failed or not configured."
+        
+        if self._ai_key():
+            prompt = json.dumps({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "verdict": cluster.get("verdict"),
+                "findings": cluster.get("findings"),
+                "checks": cluster.get("checks"),
+                "elasticsearch": cluster.get("elasticsearch"),
+                "middleware": cluster.get("middleware"),
+                "pvc": (cluster.get("pvc") or {}).get("items"),
+                "workloads": (cluster.get("workloads") or {}).get("groups"),
+                "known_normals": cluster.get("known_normals"),
+                "decommissioned": cluster.get("decommissioned"),
+                "targets": {"total": total_targets, "down": down_targets},
+                "alerts": {"firing": firing},
+                "fleet": fleet_summary,
+            }, ensure_ascii=False, indent=2)
+            system_prompt = (
+                "你是一名专业资深的系统运维工程师（偏 SRE）。"
+                "请基于我提供的巡检数据，输出一份可执行的中文巡检报告。"
+                "Elasticsearch 用 elasticsearch-exporter 的集群色/节点/堆，不要说没查到。"
+                "中间件按 Prometheus 指标名扫描：对上 redis_/mysql_/aws_rds_ 等前缀，或未被食谱覆盖的 *_up 才写入。没有扫到就是未覆盖，不要调 AWS API，不要写成健康。"
+                "PVC 必须按每一块盘写用量，不要合并成一个服务。"
+                "workloads 一眼是 Deploy/STS 的 Ready n/m；pods 里才是 Pod 名、Pod IP、节点 IP。"
+                "known_normals 里的项不要当成故障。"
+                "decommissioned / 已下线残留是还能扫到、但不在当前 kube 节点上的抓取，提醒清理 scrape，不要写成故障。"
+                "checks 里 level=skip 表示缺指标，请写明未覆盖，不要写成健康。"
+                "不要输出安全漏洞/CVE/风险扫描相关内容。"
+                "输出结构必须包含：\n"
+                "1) 总览（对应 verdict）\n"
+                "2) 检查清单\n"
+                "3) Elasticsearch\n"
+                "4) 工作负载（一眼 n/m，展开看 Pod/IP）\n"
+                "5) 全部 PVC 用量\n"
+                "6) 资源热点与告警\n"
+                "7) 处置建议（P0/P1/P2）\n"
+                f"\n报告生成时间：{_today_id()}\n"
+            )
+            
+            # Detect provider：仅外部自定义网关走 OpenAI 兼容；与平台同地址时仍可走 Gemini。
+            try:
+                stored_custom = sanitize_http_url(self.config.ark_base_url)
+            except ValueError:
+                stored_custom = ""
+            try:
+                platform_base = sanitize_http_url(app_settings.llm_base_url)
+            except ValueError:
+                platform_base = ""
+            external_custom = bool(stored_custom and not hosts_match(stored_custom, platform_base))
+            model_id = (self._ai_model() or "").lower()
+            if external_custom:
+                log("inspection", f"Using custom OpenAI compatible API with model: {self._ai_model()}")
+                ai_analysis = self._call_openai_compatible_api(prompt, system_prompt)
+            elif "gemini" in model_id:
+                log("inspection", f"Using Google Gemini API with model: {self._ai_model()}")
+                ai_analysis = self._call_gemini_api(prompt, system_prompt)
+            elif self._ai_base():
+                log("inspection", f"Using OpenAI compatible API with model: {self._ai_model()}")
+                ai_analysis = self._call_openai_compatible_api(prompt, system_prompt)
+            else:
+                log("inspection", "AI config missing Base URL for non-Gemini model")
+                ai_analysis = "AI configuration error: Missing Base URL."
+        else:
+            log("inspection", "AI analysis skipped (not configured)")
+
+        # 3. Calculate score then compare with yesterday
+        log("inspection", "Comparing with yesterday's report...")
+        yesterday_id = _date_id(1)
+        compare_data = {"yesterday_id": yesterday_id, "delta": {"risk_score": 0.0, "down_targets": 0, "firing_alerts": 0}}
+        
+        down_count = len(down_targets)
+        firing_count = len(firing)
+
+        health_score, health_level, health_reasons = self._calculate_health_score(
+            down_targets, firing, servers,
+            pvc_items=pvc_items,
+            data_insufficient=bool(cluster.get("data_insufficient")),
+            elasticsearch=cluster.get("elasticsearch"),
+            cluster=cluster,
+        )
+
+        try:
+            y_report = insp_store.get_report(yesterday_id, self._env_id)
+            if y_report:
+                y_data = y_report.content
+                y_risk = y_data.get('risk_summary', {}).get('score', 0.0)
+                y_reasons = y_data.get('risk_summary', {}).get('reasons', [])
+                y_down = len(y_data.get('down_targets', []))
+                y_firing = len(y_data.get('firing_alerts', []))
+                
+                is_legacy = False
+                if y_reasons and isinstance(y_reasons, list):
+                    if "resource_max=OK" in y_reasons or "alerts_or_targets_down" in y_reasons:
+                        is_legacy = True
+                        
+                y_health = y_risk
+                if is_legacy:
+                    y_health = 100 - y_risk
+                else:
+                    y_health = y_data.get('health_summary', {}).get('score', y_risk)
+                
+                if health_score is None:
+                    compare_data["delta"] = {
+                        "risk_score": 0.0,
+                        "down_targets": down_count - y_down,
+                        "firing_alerts": firing_count - y_firing
+                    }
+                else:
+                    compare_data["delta"] = {
+                        "risk_score": round(health_score - y_health, 2),
+                        "down_targets": down_count - y_down,
+                        "firing_alerts": firing_count - y_firing
+                    }
+        except Exception:
+            pass
+        
+        # 5. Predict Future
+        forecast_data = self._predict_future_scores(health_score)
+
+        critical_count = sum(1 for a in firing if str(a.get('severity') or '').lower() in ['critical', 'high'])
+        warning_count = sum(1 for a in firing if str(a.get('severity') or '').lower() not in ['critical', 'high'])
+
+        top_alerts = {}
+        for a in firing:
+            k = a.get('name') or 'Unknown'
+            top_alerts[k] = top_alerts.get(k, 0) + 1
+        top_alert_list = [{"name": k, "count": v} for k, v in sorted(top_alerts.items(), key=lambda x: x[1], reverse=True)[:10]]
+
+        trend = []
+        try:
+            for i in range(6, -1, -1):
+                d = _date_id(i)
+                r = insp_store.get_report(d, self._env_id)
+                if r and r.content:
+                    hs = r.content.get('health_summary', {}).get('score')
+                    if hs is None:
+                        hs = r.content.get('risk_summary', {}).get('score')
+                    a_sum = r.content.get('alerts_summary', {})
+                    f_total = a_sum.get('firing_total')
+                    c_total = a_sum.get('critical_total')
+                    fleet = r.content.get('fleet_summary', {})
+                    trend.append({
+                        "date": d,
+                        "score": hs,
+                        "firing": f_total,
+                        "critical": c_total,
+                        "avg_cpu": fleet.get('avg_cpu_pct'),
+                        "avg_mem": fleet.get('avg_mem_pct'),
+                        "avg_disk": fleet.get('avg_disk_pct'),
+                    })
+        except Exception:
+            pass
+
+        # 6. Final Report
+        report = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "prometheus_status": "ok" if total_targets > 0 else "error",
+            "down_targets": down_targets,
+            "firing_alerts": firing,
+            "alerts_summary": {
+                "firing_total": len(firing),
+                "critical_total": critical_count,
+                "warning_total": warning_count,
+                "top_alerts": top_alert_list,
+            },
+            "servers": servers,
+            "fleet_summary": fleet_summary,
+            "metrics_summary": metrics_summary,
+            "ai_analysis": ai_analysis,
+            "report_id": report_id,
+            "score": health_score,
+            "level": health_level,
+            "health_summary": {
+                "score": health_score,
+                "level": health_level,
+                "reasons": health_reasons
+            },
+            "compare_with_yesterday": compare_data,
+            "forecast_7_15_30": {
+                "predictions": forecast_data
+            },
+            "trend_7d": trend,
+            "cluster": cluster,
+            "checklist": cluster.get("checks") or [],
+            "findings": cluster.get("findings") or [],
+            "verdict": cluster.get("verdict") or "",
+            "pvc_usage": (cluster.get("pvc") or {}).get("items") or [],
+            "workloads": (cluster.get("workloads") or {}).get("groups") or [],
+            "workload_pods": (cluster.get("workloads") or {}).get("items") or [],
+            "services": cluster.get("services") or [],
+            "elasticsearch": cluster.get("elasticsearch") or {},
+            "middleware": cluster.get("middleware") or {},
+            "discovery": cluster.get("discovery") or {},
+            "known_normals": cluster.get("known_normals") or [],
+            "decommissioned": cluster.get("decommissioned") or [],
+        }
+        
+        # Save to DB
+        insp_store.upsert_report(report_id, report, self._env_id)
+
+        # shore-aiops 使用事件中心承接处置，不迁入 shark ops_tickets。
+        
+        log("inspection", "Inspection run completed.")
+        return report
+
+inspection_engine = InspectionEngine()

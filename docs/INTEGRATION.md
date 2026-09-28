@@ -429,9 +429,9 @@ docker compose up -d --build
 | 事件中心 | `/incidents` | Alertmanager webhook 或手动 POST | ✅ |
 | Pod 管理 | `/pods` | Kubeconfig | ✅ |
 | 发布管理 | `/deployments` | GitLab Token + ArgoCD（回滚可选） | ✅ |
-| 日志监控 | `/logs` | 日志目录 + Slack（可选） | ✅ |
+| 日志监控 | `/logs` | K8s kubeconfig + Slack / S3（可选） | ✅ |
 | 安全合规 | `/security` | 扫描工具（镜像内已装） | ✅ |
-| 监控巡检 | `/monitoring` | Kubeconfig + Prometheus（可选） | ✅ |
+| 监控巡检 | `/monitoring` | Prometheus（清单巡检）+ 可选 LLM | ✅ |
 | 成本分析 | `/cost` | 服务发现数据 | ✅ |
 | 值班排班 | `/schedules` | 无 | ✅ |
 | 运维助手 | `/copilot` | LLM_API_KEY | ✅ |

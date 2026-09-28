@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import auth, deployments, health, home, incidents, knowledge, monitor, ops, security, settings_api, topology
+from app.api import auth, deployments, health, home, incidents, inspection, knowledge, monitor, ops, security, settings_api, topology
 from app.core.config import settings
 from app.core.logging import get_logger, setup_logging
 from app.scheduler import start_scheduler, stop_scheduler
@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
-    description="Shore AIOps — 告警、发布、日志、拓扑",
+    description="Shore AIOps — 告警、发布、日志、巡检、拓扑",
     lifespan=lifespan,
     docs_url="/docs",
     openapi_url="/openapi.json",
@@ -72,6 +72,7 @@ app.include_router(settings_api.router, prefix="/api")
 app.include_router(security.router, prefix="/api")
 app.include_router(deployments.router, prefix="/api")
 app.include_router(monitor.router, prefix="/api")
+app.include_router(inspection.router, prefix="/api")
 app.include_router(ops.router, prefix="/api")
 
 

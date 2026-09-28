@@ -3,10 +3,10 @@
 import { Suspense, useCallback, useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'next/navigation'
 import {
-  FileText, Loader2, Plus, RefreshCw, Search, Settings2, Trash2, WifiOff, ChevronLeft, ChevronRight,
+  FileText, Loader2, Plus, RefreshCw, Search, Settings2, Trash2, WifiOff, ChevronLeft, ChevronRight, Download, History,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { apiJson } from '@/lib/api'
+import { apiJson, apiFetch } from '@/lib/api'
 import { useEnvironments } from '@/lib/useEnvironments'
 
 const FILE_PAGE_SIZE = 30
@@ -34,6 +34,14 @@ interface MonitorTask {
   slack_webhook_url?: string | null
   slack_webhook_set?: boolean
   retention_days: number
+  k8s_kubeconfig?: string
+  k8s_kubeconfig_set?: boolean
+  s3_bucket?: string | null
+  s3_region?: string
+  s3_access_key?: string | null
+  s3_secret_key?: string | null
+  s3_secret_key_set?: boolean
+  s3_endpoint?: string | null
 }
 
 interface LogFile {
@@ -59,6 +67,12 @@ const emptyTask = (envId = 'test'): Partial<MonitorTask> => ({
   alert_threshold_window: 60,
   alert_silence_minutes: 60,
   retention_days: 3,
+  s3_bucket: '',
+  s3_region: 'us-east-1',
+  s3_access_key: '',
+  s3_secret_key: '',
+  s3_endpoint: '',
+  k8s_kubeconfig: '',
 })
 
 function fmtSize(n?: number) {
@@ -118,6 +132,14 @@ function LogsPageContent() {
   const [showEditor, setShowEditor] = useState(false)
   const [draft, setDraft] = useState<Partial<MonitorTask>>(emptyTask())
   const [saving, setSaving] = useState(false)
+  const [showHistory, setShowHistory] = useState(false)
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [historyStart, setHistoryStart] = useState('')
+  const [historyEnd, setHistoryEnd] = useState('')
+  const [historyKeyword, setHistoryKeyword] = useState('')
+  const [historyLogType, setHistoryLogType] = useState<'raw' | 'error'>('raw')
+  const [historyItems, setHistoryItems] = useState<{ key: string; window_start?: string; size?: number }[]>([])
+  const [historyDetail, setHistoryDetail] = useState<{ name?: string; size?: number; key?: string }[]>([])
 
   const visibleTasks = useMemo(() => {
     if (showAllEnvs) return tasks
@@ -195,6 +217,17 @@ function LogsPageContent() {
   useEffect(() => { loadTasks() }, [loadTasks, activeEnv])
 
   useEffect(() => {
+    if (!selected || showAllEnvs) return
+    const env = activeEnv || 'test'
+    if ((selected.environment_id || 'test') !== env) {
+      setSelected(null)
+      setFiles([])
+      setContent('')
+      setActiveFile(null)
+    }
+  }, [activeEnv, showAllEnvs, selected])
+
+  useEffect(() => {
     const taskId = searchParams.get('taskId')
     const filename = searchParams.get('filename')
     if (!taskId || tasks.length === 0) return
@@ -228,13 +261,23 @@ function LogsPageContent() {
   const saveTask = async () => {
     setSaving(true)
     try {
-      const payload = {
+      const payload: Record<string, unknown> = {
         ...draft,
         alert_keywords: textToLines(linesToText(draft.alert_keywords as string[] | string)),
         immediate_keywords: textToLines(linesToText(draft.immediate_keywords as string[] | string)),
         ignore_keywords: textToLines(linesToText(draft.ignore_keywords as string[] | string)),
         record_only_keywords: textToLines(linesToText(draft.record_only_keywords as string[] | string)),
       }
+      for (const k of [
+        'id', 'last_run', 'last_error', 'alerts_sent_count', 'alert_state', 'threshold_state',
+        'created_at', 'updated_at', 'slack_webhook_set', 'k8s_kubeconfig_set', 's3_secret_key_set',
+      ]) {
+        delete payload[k]
+      }
+      if (!payload.k8s_kubeconfig) delete payload.k8s_kubeconfig
+      if (!payload.s3_secret_key) delete payload.s3_secret_key
+      if (typeof payload.s3_access_key === 'string' && payload.s3_access_key.startsWith('****')) delete payload.s3_access_key
+      if (typeof payload.slack_webhook_url === 'string' && payload.slack_webhook_url.startsWith('•')) delete payload.slack_webhook_url
       const isEdit = Boolean(draft.id)
       await apiJson(
         isEdit ? `/api/monitor/tasks/${draft.id}` : '/api/monitor/tasks',
@@ -261,6 +304,67 @@ function LogsPageContent() {
       setContent('')
     }
     await loadTasks()
+  }
+
+  const downloadLog = async (task: MonitorTask, filename: string) => {
+    const res = await apiFetch(`/api/monitor/logs/download?task_id=${task.id}&filename=${encodeURIComponent(filename)}`)
+    if (!res.ok) {
+      alert('下载失败')
+      return
+    }
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename.split('/').pop() || 'log.log'
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const openHistory = () => {
+    const end = new Date()
+    const start = new Date(end.getTime() - 7 * 24 * 3600 * 1000)
+    setHistoryStart(start.toISOString().slice(0, 16))
+    setHistoryEnd(end.toISOString().slice(0, 16))
+    setHistoryItems([])
+    setHistoryDetail([])
+    setShowHistory(true)
+  }
+
+  const searchHistory = async () => {
+    if (!selected) return
+    setHistoryLoading(true)
+    try {
+      const params = new URLSearchParams({
+        task_id: selected.id,
+        log_type: historyLogType,
+        start: historyStart,
+        end: historyEnd,
+        keyword: historyKeyword,
+      })
+      const data = await apiJson<{ items: { key: string; window_start?: string; size?: number }[] }>(`/api/monitor/logs/history?${params}`)
+      setHistoryItems(data.items || [])
+      setHistoryDetail([])
+    } catch (e) {
+      alert(e instanceof Error ? e.message : '历史查询失败')
+    } finally {
+      setHistoryLoading(false)
+    }
+  }
+
+  const loadHistoryDetail = async (key: string) => {
+    if (!selected) return
+    setHistoryLoading(true)
+    try {
+      const data = await apiJson<{ files?: { name?: string; size?: number; key?: string }[] }>(
+        `/api/monitor/logs/index_detail?task_id=${selected.id}&key=${encodeURIComponent(key)}`
+      )
+      setHistoryDetail(data.files || [])
+    } catch (e) {
+      alert(e instanceof Error ? e.message : '索引详情失败')
+    } finally {
+      setHistoryLoading(false)
+    }
   }
 
   const contentTotalPages = Math.max(1, Math.ceil(contentTotal / CONTENT_PAGE_SIZE))
@@ -392,6 +496,16 @@ function LogsPageContent() {
                   {activeFile && keyword && (
                     <button onClick={() => viewLog(selected, activeFile, 1, keyword)} className="text-xs px-3 py-1.5 rounded bg-shark-accent/20 text-shark-accent">搜索内容</button>
                   )}
+                  {activeFile && (
+                    <button onClick={() => downloadLog(selected, activeFile)} className="text-xs px-3 py-1.5 rounded border border-shark-border text-shark-muted hover:text-white flex items-center gap-1">
+                      <Download size={12} /> 下载
+                    </button>
+                  )}
+                  {selected.s3_archive_enabled && (
+                    <button onClick={openHistory} className="text-xs px-3 py-1.5 rounded border border-shark-border text-shark-muted hover:text-white flex items-center gap-1">
+                      <History size={12} /> 历史
+                    </button>
+                  )}
                   <span className="text-[10px] text-shark-muted ml-auto">{fileTotal} 个文件</span>
                 </div>
               </div>
@@ -476,6 +590,51 @@ function LogsPageContent() {
         </div>
       </div>
 
+      {showHistory && selected && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+          <div className="glass rounded-xl w-full max-w-3xl max-h-[85vh] overflow-auto p-5 space-y-4">
+            <h2 className="text-sm font-semibold text-white">S3 历史索引 · {selected.name}</h2>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+              <Field label="开始"><input type="datetime-local" value={historyStart} onChange={(e) => setHistoryStart(e.target.value)} className="input-field" /></Field>
+              <Field label="结束"><input type="datetime-local" value={historyEnd} onChange={(e) => setHistoryEnd(e.target.value)} className="input-field" /></Field>
+              <Field label="类型">
+                <select value={historyLogType} onChange={(e) => setHistoryLogType(e.target.value as 'raw' | 'error')} className="input-field">
+                  <option value="raw">raw</option>
+                  <option value="error">error</option>
+                </select>
+              </Field>
+              <Field label="关键词"><input value={historyKeyword} onChange={(e) => setHistoryKeyword(e.target.value)} className="input-field" /></Field>
+            </div>
+            <button onClick={searchHistory} disabled={historyLoading} className="text-xs px-3 py-1.5 rounded bg-shark-accent text-white disabled:opacity-50">
+              {historyLoading ? '查询中...' : '搜索'}
+            </button>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="border border-shark-border rounded-lg max-h-64 overflow-auto">
+                {historyItems.length === 0 && <p className="text-xs text-shark-muted p-3">无索引</p>}
+                {historyItems.map((it) => (
+                  <button key={it.key} onClick={() => loadHistoryDetail(it.key)} className="w-full text-left px-3 py-2 text-xs border-b border-shark-border/50 hover:bg-white/[0.03]">
+                    <div className="text-white truncate">{it.window_start || it.key}</div>
+                    <div className="text-shark-muted">{fmtSize(it.size)}</div>
+                  </button>
+                ))}
+              </div>
+              <div className="border border-shark-border rounded-lg max-h-64 overflow-auto">
+                {historyDetail.length === 0 && <p className="text-xs text-shark-muted p-3">选择左侧索引查看文件</p>}
+                {historyDetail.map((f, i) => (
+                  <div key={f.key || f.name || i} className="px-3 py-2 text-xs border-b border-shark-border/50 flex justify-between">
+                    <span className="text-white truncate">{f.name || f.key}</span>
+                    <span className="text-shark-muted shrink-0 ml-2">{fmtSize(f.size)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="flex justify-end">
+              <button onClick={() => setShowHistory(false)} className="text-xs px-4 py-2 rounded border border-shark-border text-shark-muted">关闭</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showEditor && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
           <div className="glass rounded-xl w-full max-w-lg max-h-[85vh] overflow-auto p-5 space-y-4">
@@ -488,6 +647,34 @@ function LogsPageContent() {
               </select>
             </Field>
             <Field label="K8s 命名空间（逗号分隔）"><input value={draft.k8s_namespace || ''} onChange={(e) => setDraft({ ...draft, k8s_namespace: e.target.value })} className="input-field" /></Field>
+            <Field label="Kubeconfig（YAML）">
+              <textarea
+                rows={3}
+                value={draft.k8s_kubeconfig || ''}
+                onChange={(e) => setDraft({ ...draft, k8s_kubeconfig: e.target.value })}
+                className="input-field font-mono"
+                placeholder={draft.k8s_kubeconfig_set ? '凭据已保存：留空表示不修改' : '留空则用设置页入库的 kubeconfig / in-cluster'}
+              />
+            </Field>
+            <label className="flex items-center gap-2 text-xs text-white">
+              <input type="checkbox" checked={!!draft.s3_archive_enabled} onChange={(e) => setDraft({ ...draft, s3_archive_enabled: e.target.checked })} /> 启用 S3 归档
+            </label>
+            {draft.s3_archive_enabled && (
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="S3 Bucket"><input value={draft.s3_bucket || ''} onChange={(e) => setDraft({ ...draft, s3_bucket: e.target.value })} className="input-field" /></Field>
+                <Field label="Region"><input value={draft.s3_region || 'us-east-1'} onChange={(e) => setDraft({ ...draft, s3_region: e.target.value })} className="input-field" /></Field>
+                <Field label="Access Key"><input value={draft.s3_access_key || ''} onChange={(e) => setDraft({ ...draft, s3_access_key: e.target.value })} className="input-field" /></Field>
+                <Field label="Secret Key">
+                  <input
+                    value={draft.s3_secret_key || ''}
+                    onChange={(e) => setDraft({ ...draft, s3_secret_key: e.target.value })}
+                    className="input-field"
+                    placeholder={draft.s3_secret_key_set ? '已保存：留空不修改' : ''}
+                  />
+                </Field>
+                <Field label="Endpoint（可选）"><input value={draft.s3_endpoint || ''} onChange={(e) => setDraft({ ...draft, s3_endpoint: e.target.value })} className="input-field" /></Field>
+              </div>
+            )}
             <div className="grid grid-cols-2 gap-3">
               <Field label="轮询间隔(秒)"><input type="number" value={draft.poll_interval_seconds || 60} onChange={(e) => setDraft({ ...draft, poll_interval_seconds: +e.target.value })} className="input-field" /></Field>
               <Field label="保留天数"><input type="number" value={draft.retention_days || 3} onChange={(e) => setDraft({ ...draft, retention_days: +e.target.value })} className="input-field" /></Field>

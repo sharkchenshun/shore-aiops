@@ -190,7 +190,18 @@ Header: Authorization: Bearer <ALERTMANAGER_WEBHOOK_TOKEN>
 | `LOG_MONITOR_DIR` | 空 | 监控目录，空则用 `backend/logs/monitor_logs` |
 
 把各服务日志文件 symlink 或挂载到该目录，按文件名匹配服务。  
-告警走 Slack（同上 `SLACK_WEBHOOK_URL`），前端在 `/logs` 看规则和历史。
+告警走 Slack（同上 `SLACK_WEBHOOK_URL`），前端在 `/logs` 看规则、S3 历史和下载。
+
+---
+
+## 8.1 集群巡检（shark-Platform inspection）
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `INSPECTION_ENABLED` | `true` | 每日 Prometheus 清单巡检 |
+| `INSPECTION_CRON` | `0 8 * * *` | 默认同 shark-Platform：每天 08:00 |
+
+Prometheus URL 优先用巡检配置页，其次 `environments.json` / `PROMETHEUS_URL`。AI 分析可用巡检页 ark_* 或平台 `LLM_*`。页面 `/monitoring`。清单语义见 [INSPECTION.md](./INSPECTION.md)。
 
 ---
 
